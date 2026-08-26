@@ -58,6 +58,20 @@
           <tbody><tr><td colspan="5" class="muted">no devices connected</td></tr></tbody>
         </table>
       </section>
+
+      <section class="panel">
+        <h2>Firmware</h2>
+        <label for="ota-device">Device</label>
+        <select id="ota-device"></select>
+
+        <label for="ota-file">ESP-IDF application image</label>
+        <input id="ota-file" type="file" accept=".bin,application/octet-stream" />
+
+        <div class="row">
+          <button id="ota-install" type="button">Install firmware</button>
+        </div>
+        <p class="muted" id="ota-status">Select a connected device and matrix_studio.bin.</p>
+      </section>
     </main>
 
     <script src="static/app.js"></script>

@@ -15,8 +15,17 @@ dependencies:
   # documented, unresolved Wi-Fi/DMA interference issue on ESP32-S3 boards —
   # exactly the failure mode this project cannot tolerate. It is also what
   # Waveshare's own ESP-IDF BSP for this board family uses.
+  #
+  # Pin the upstream FM6124 fix exactly. The 0.3.6 registry release exposes the
+  # FM6124 enum but returns ESP_ERR_NOT_SUPPORTED during driver initialization;
+  # upstream commit 41c52e9 wires FM6124 to the proven FM6126A REG1/REG2 init
+  # sequence. Keep this commit pin until that fix is present in a registry
+  # release we can move to deliberately.
   # See docs/hardware.md "Library and toolchain choice".
-  esphome/esp-hub75: "^0.3.6"
+  hub75:
+    git: https://github.com/esphome-libs/esp-hub75.git
+    path: components/hub75
+    version: 41c52e9fa1ded069f339d1b5eb583ce0b4861d14
 
   # WebSocket client. Lives outside esp-idf proper since v5.0.
   espressif/esp_websocket_client: "^1.2.3"

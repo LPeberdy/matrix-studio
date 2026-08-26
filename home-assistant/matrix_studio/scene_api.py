@@ -141,7 +141,7 @@ class HomeState:
 class Controls:
     """User-facing display controls, shared (mutable) between UI and engine."""
 
-    brightness: int = 160
+    brightness: int = 90
     blank: bool = False
     active_scene: str = "plasma"
     width: int = PANEL_WIDTH

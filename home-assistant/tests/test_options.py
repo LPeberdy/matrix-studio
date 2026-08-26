@@ -19,6 +19,7 @@ def test_defaults_match_the_frozen_protocol_defaults():
     assert options.ws_port == proto.DEFAULT_WS_PORT == 7887
     assert options.ws_path == proto.DEFAULT_WS_PATH == "/matrix-studio"
     assert options.active_scene == "plasma"
+    assert options.brightness == 90
     assert 1 <= options.target_fps <= 60
     assert options.entity_roles == {}
     assert options.light_entities == ()

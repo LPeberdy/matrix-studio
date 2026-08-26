@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 
 from .framebuffer import rgb565_to_image
+from .server import MAX_OTA_IMAGE_BYTES, OtaUpdateError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .app import MatrixStudioApp
@@ -44,7 +45,9 @@ class IngressWeb:
     # ------------------------------------------------------------------- setup
 
     def make_app(self) -> web.Application:
-        app = web.Application()
+        # The largest valid firmware fits a 3 MiB OTA slot. Keep a small margin
+        # for HTTP framing while still rejecting accidental giant uploads.
+        app = web.Application(client_max_size=MAX_OTA_IMAGE_BYTES + 64 * 1024)
         app.router.add_get("/", self.index)
         app.router.add_get("/index.html", self.index)
         app.router.add_get("/api/status", self.status)
@@ -53,6 +56,7 @@ class IngressWeb:
         app.router.add_post("/api/brightness", self.set_brightness)
         app.router.add_post("/api/blank", self.set_blank)
         app.router.add_post("/api/reload", self.reload_scenes)
+        app.router.add_post("/api/ota", self.ota_update)
         app.router.add_static("/static/", STATIC_DIR, name="static")
         return app
 
@@ -139,6 +143,30 @@ class IngressWeb:
     async def reload_scenes(self, request: web.Request) -> web.Response:
         self.studio.reload_scenes()
         return web.json_response({"ok": True, "scenes": self.studio.engine.registry.names()})
+
+    async def ota_update(self, request: web.Request) -> web.Response:
+        try:
+            connection_id = int(request.query.get("connection_id", ""))
+        except (TypeError, ValueError):
+            return web.json_response({"ok": False, "error": "connection_id must be an integer"}, status=400)
+
+        image = await request.read()
+        if not image:
+            return web.json_response({"ok": False, "error": "firmware image is empty"}, status=400)
+
+        try:
+            await self.studio.server.ota_update(connection_id, image)
+        except OtaUpdateError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=409)
+
+        return web.json_response(
+            {
+                "ok": True,
+                "connection_id": connection_id,
+                "bytes": len(image),
+                "message": "firmware committed; device rebooting",
+            }
+        )
 
     @staticmethod
     async def _json(request: web.Request) -> dict[str, Any]:
