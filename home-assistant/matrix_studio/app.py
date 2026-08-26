@@ -27,8 +27,8 @@ from .web import IngressWeb
 
 _LOGGER = logging.getLogger(__name__)
 
-#: Copied into the user's scenes directory the first time it is created, so a
-#: new install has something to edit rather than an empty folder.
+#: Bundled user-scene examples. Missing files are copied into the configured
+#: scenes directory on startup; existing user files are never overwritten.
 EXAMPLE_SCENES_DIR = pathlib.Path(__file__).resolve().parents[1] / "example_scenes"
 
 
@@ -150,16 +150,24 @@ class MatrixStudioApp:
     # ---------------------------------------------------------------- lifecycle
 
     def ensure_scenes_dir(self) -> None:
-        """Create the user scenes directory and seed it with examples once."""
+        """Create the user scene directory and add any missing bundled examples."""
         try:
             directory = pathlib.Path(self.options.scenes_dir)
-            existed = directory.exists()
             directory.mkdir(parents=True, exist_ok=True)
-            if not existed and EXAMPLE_SCENES_DIR.is_dir():
+
+            copied: list[str] = []
+            if EXAMPLE_SCENES_DIR.is_dir():
                 for source in EXAMPLE_SCENES_DIR.iterdir():
-                    if source.is_file():
-                        shutil.copy2(source, directory / source.name)
-                _LOGGER.info("seeded %s with example scenes", directory)
+                    if not source.is_file():
+                        continue
+                    destination = directory / source.name
+                    if destination.exists():
+                        continue
+                    shutil.copy2(source, destination)
+                    copied.append(source.name)
+
+            if copied:
+                _LOGGER.info("added %d missing example file(s) to %s: %s", len(copied), directory, ", ".join(copied))
                 self.registry.load()
         except OSError as exc:
             _LOGGER.warning("could not prepare scenes directory %s: %s", self.options.scenes_dir, exc)
