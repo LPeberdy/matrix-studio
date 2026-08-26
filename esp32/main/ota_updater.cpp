@@ -4,7 +4,7 @@
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
-#include "protocol/matrix_studio_ota.h"
+#include "matrix_studio_protocol.h"
 
 namespace matrix_studio {
 namespace ota {
@@ -74,7 +74,7 @@ Result begin(uint32_t image_size) {
 Result write(uint32_t offset, const uint8_t* data, size_t len) {
   if (!g_active) return Result::kNotActive;
   if (data == nullptr || len == 0) return Result::kInvalidSize;
-  if (len > matrix_studio_ota::kMaxChunkBytes) return Result::kChunkTooLarge;
+  if (len > matrix_studio_protocol::kOtaMaxChunkBytes) return Result::kChunkTooLarge;
   if (offset != g_written) return Result::kOffsetMismatch;
   if (len > static_cast<size_t>(g_expected_size - g_written)) return Result::kInvalidSize;
 
