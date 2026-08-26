@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  protocol-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python3 -m venv .venv && .venv/bin/pip install -r protocol/requirements-dev.txt
+      - run: .venv/bin/python -m pytest protocol/tests -q
+
+  home-assistant-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python3 -m venv .venv && .venv/bin/pip install -r home-assistant/requirements-dev.txt
+      - run: .venv/bin/python -m pytest home-assistant/tests -q
+
+  esp32-host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -U platformio
+      - run: cd esp32 && pio test -e native
+
+  esp32-firmware-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -U platformio
+      - run: cd esp32 && pio run -e esp32-s3-hub75

@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Home Assistant add-on local config/secrets
+home-assistant/config.local.yaml
+home-assistant/secrets.yaml
+*.local.yaml
+
+# ESP32 / PlatformIO
+esp32/.pio/
+esp32/secrets.h
+esp32/wifi_secrets.h
+
+# Editors / OS
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Node (ingress UI tooling, if any)
+node_modules/

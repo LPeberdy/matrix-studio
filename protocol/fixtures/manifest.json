@@ -1,0 +1,63 @@
+{
+  "brightness.bin": {
+    "description": "A well-formed BRIGHTNESS command set to 128.",
+    "expect": {
+      "brightness": 128,
+      "type": "BRIGHTNESS"
+    }
+  },
+  "heartbeat_ping.bin": {
+    "description": "A well-formed PING with nonce 0xDEADBEEF.",
+    "expect": {
+      "nonce": 3735928559,
+      "type": "PING"
+    }
+  },
+  "malformed_header.bin": {
+    "description": "A message whose magic byte is 0xFF instead of 0xA5; must be rejected before the header is otherwise trusted.",
+    "expect": {
+      "expect_error": "bad_magic"
+    }
+  },
+  "truncated_frame.bin": {
+    "description": "A FRAME header declaring the full 8206-byte payload, but only 100 bytes actually follow (e.g. a dropped TCP segment); must be detected as malformed, not read out of bounds.",
+    "expect": {
+      "actual_payload_bytes": 100,
+      "declared_length": 8206,
+      "expect_error": "truncated",
+      "type": "FRAME"
+    }
+  },
+  "unsupported_version.bin": {
+    "description": "A HELLO declaring protocol_version=99 in both the header and payload; server must reply STATUS(ERR_UNSUPPORTED_VERSION) and close.",
+    "expect": {
+      "expect_error": "unsupported_version",
+      "header_version": 99,
+      "type": "HELLO"
+    }
+  },
+  "valid_frame_64x64.bin": {
+    "description": "A well-formed 64x64 RGB565 FRAME with sequence=42.",
+    "expect": {
+      "height": 64,
+      "pixel_bytes": 8192,
+      "pixel_format": 1,
+      "sequence": 42,
+      "timestamp_ms": 123456,
+      "type": "FRAME",
+      "width": 64
+    }
+  },
+  "valid_hello.bin": {
+    "description": "A well-formed HELLO from a 64x64 RGB565 device.",
+    "expect": {
+      "device_id": "matrix-esp32-01",
+      "fw_version": "0.1.0",
+      "height": 64,
+      "pixel_format": 1,
+      "protocol_version": 1,
+      "type": "HELLO",
+      "width": 64
+    }
+  }
+}
