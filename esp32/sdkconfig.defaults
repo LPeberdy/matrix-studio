@@ -7,13 +7,17 @@
 CONFIG_IDF_TARGET="esp32s3"
 
 # --- Flash / partitions ------------------------------------------------------
-# 4MB is the smallest variant this board family ships with; boards with more
-# flash still work. Raise CONFIG_ESPTOOLCHAIN_FLASHSIZE if you want the extra
-# space for OTA later.
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+# The documented Hengantech/Seengreat controller uses ESP32-S3-WROOM-1-N16R8:
+# 16MB flash / 8MB PSRAM. Use a factory + two-slot OTA table from the very
+# first wired flash so future firmware can be updated over Matrix Studio's
+# existing WebSocket connection (docs/ota.md).
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # --- PSRAM -------------------------------------------------------------------
 # Enabled so PSRAM is *usable* when present. Nothing in the firmware assumes it
