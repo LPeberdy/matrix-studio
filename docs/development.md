@@ -35,6 +35,19 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 See `home-assistant/README.md` for add-on installation, scene authoring, and
 emulator/preview usage.
 
+## End-to-end integration tests
+
+`tests/integration/` starts the real Home Assistant add-on and drives it over
+an actual WebSocket connection using the *canonical* protocol codec
+(`protocol/matrix_studio_protocol.py`), not the add-on's internal vendored
+copy — proving the two independently-built sides of the frozen contract
+actually agree on the wire, not just that each is internally self-consistent.
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install -r tests/integration/requirements-dev.txt
+.venv/bin/python -m pytest tests/integration -q
+```
+
 ## ESP32 firmware
 
 See `esp32/README.md` for toolchain setup, building, flashing, and Wi-Fi

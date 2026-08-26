@@ -1,0 +1,2 @@
+-r ../../home-assistant/requirements.txt
+-r ../../home-assistant/requirements-dev.txt

@@ -2,6 +2,18 @@
 
 **Status: Protocol v1 frozen.**
 
+**Errata note:** after the Home Assistant and ESP32 sides were built
+independently against this document, both reported (via their own
+`PROTOCOL_ISSUES.md`) a handful of genuine lifecycle ambiguities — places
+where the prose supported two readings. Both implementations happened to
+converge on the same reading in every case. The protocol owner (this
+document) has since clarified those spots in place (§3.1, §3.2, §3.5, §4.5,
+§5) to match the interpretation both sides already implemented. **No wire
+bytes, field layouts, or message semantics changed** — this is documentation
+catching up to an ambiguity that implementation already resolved, not a
+protocol revision, so it did not require a version bump or changes to either
+implementation.
+
 This document is the single source of truth for how the Home Assistant side
 ("server") and the ESP32-S3 side ("device") of Matrix Studio talk to each
 other. Once frozen, implementation agents on either side MUST NOT change
@@ -90,6 +102,16 @@ exactly 8192 bytes.
 - If a `PING` is not answered within `PONG_TIMEOUT_MS = 10000`, the sender
   MUST treat the connection as dead: close it and (if it is the device)
   begin the reconnect procedure in §3.3.
+- **At most one `PING` may be outstanding at a time per sender.** Since
+  `PING_INTERVAL_MS` and `PONG_TIMEOUT_MS` are equal, a sender that fires a
+  new `PING` on every interval tick regardless of outstanding ones can
+  declare a merely-slow link dead right as the next `PING` is due. Instead:
+  if a `PING` is already outstanding when the next interval elapses, do not
+  send another — just keep checking the outstanding one's age against
+  `PONG_TIMEOUT_MS`, and only close once that deadline is strictly
+  exceeded. A `PONG` whose `nonce` doesn't match the outstanding `PING` is
+  ignored as a heartbeat reply (but still counts as evidence of a live
+  socket).
 
 ### 3.2 Frame timeout / no-signal behaviour
 
@@ -102,6 +124,13 @@ exactly 8192 bytes.
 - This is deliberately decoupled from the heartbeat/connection-liveness
   logic in §3.1: a connection can be alive with no frames (idle scene), and
   the device should not reconnect just because frames paused.
+- **`BLANK(1)` (§4.5) takes precedence over this no-signal fallback.** While
+  explicitly blanked, a device must not show a no-signal indicator (that
+  would contradict the explicit "go dark" command); it should simply stay
+  blank. A server that honors `BLANK(1)` by pausing its `FRAME` stream (the
+  expected implementation — see §4.5) is not thereby telling the device
+  anything has gone wrong, and the device's own frame-timeout clock is
+  irrelevant until `BLANK(0)` resumes normal streaming.
 
 ### 3.3 Reconnection
 
@@ -143,12 +172,31 @@ On receipt of any message, the receiver validates, in order:
    implies `width * height * bytes_per_pixel`), the actual payload size
    must match — else send `STATUS(ERR_MALFORMED_PAYLOAD)` and discard just
    that message (do not close the connection; a single bad frame should not
-   drop an otherwise-healthy session).
+   drop an otherwise-healthy session). **This rule also covers the case
+   where `header.length` is itself legal (≤ `MAX_PAYLOAD_BYTES`) but the
+   bytes actually received for this message are fewer than `length`
+   declares** — e.g. the `truncated_frame` fixture, where a well-formed
+   header claims a full 8206-byte `FRAME` payload but only 100 bytes
+   follow. On a message-oriented transport (§1: one WebSocket message per
+   protocol message), that size mismatch is detected as soon as the
+   WebSocket message ends, without needing to block waiting for more bytes
+   that a byte-stream transport might legitimately still be delivering.
+   Treat it exactly like any other payload-size mismatch: `STATUS
+   (ERR_MALFORMED_PAYLOAD)`, discard, keep the connection.
+6. A message that is well-formed per rules 1-5 but arrives in an
+   unexpected context — a second `HELLO` on an already-handshaked
+   connection, or a message arriving in the direction it's not defined for
+   (e.g. `FRAME` from a device) — is not a framing error and must not close
+   the connection. Log it and ignore it, continuing the session with
+   whatever state was already established (e.g. a duplicate `HELLO`'s
+   parameters do not replace the original session's).
 
 In short: corruption of the framing itself (magic/version) is fatal to the
 connection; a malformed but well-framed individual message is logged and
-discarded. Implementations must never crash on malformed input — this is
-covered by the "malformed header" / "truncated frame" fixtures.
+discarded, whether the malformation is a bad declared length, a truncated
+payload, or an out-of-context message. Implementations must never crash on
+malformed input — this is covered by the "malformed header" / "truncated
+frame" fixtures.
 
 ## 4. Message types
 
@@ -223,7 +271,10 @@ scaler; it does not affect the pixel values it receives.
 
 Payload length: 1 byte. Distinct from §3.2's no-signal state: `BLANK` is an
 explicit server command (e.g. "night mode"), while no-signal is the device's
-own fallback when frames stop arriving.
+own fallback when frames stop arriving. The expected server implementation
+pauses its `FRAME` stream while blanked (there is little point rendering and
+sending frames nobody sees) and sends `BLANK(0)` before resuming; see §3.2
+for why the device must not treat that pause as a no-signal condition.
 
 ### 4.6 `PING` (0x06, either direction)
 
@@ -264,11 +315,21 @@ Status codes:
 ## 5. Extension mechanism
 
 - `type` values `0x80`-`0xFE` are reserved for future/vendor extensions.
-  Receivers that do not recognize a type in this range MUST ignore that
-  single message (per §3.5 rule 3) rather than treating it as fatal.
+  Per §3.5 rule 3, a receiver that does not recognize a type in this range
+  (or any other unknown type) MUST NOT treat it as fatal to the
+  connection: reply `STATUS(ERR_UNKNOWN_TYPE)` and continue processing
+  further messages on the same connection — "ignore that single message"
+  means exactly this, not that the reply is skipped. A future receiver that
+  understands a given extension type handles it instead of replying
+  `STATUS`, same as for any type it has learned to recognize.
 - `type` value `0xFF` is reserved (do not use).
-- `flags` (header byte 3) is reserved and must be `0` in v1; future versions
-  may define bits here without changing the header layout.
+- `flags` (header byte 3) is reserved and must be `0` in v1. A receiver
+  MUST NOT reject a message solely for having nonzero `flags` bits — §3.5's
+  validation steps intentionally do not check `flags` at all, so that
+  future versions can define bits here without changing the header layout
+  or breaking v1 receivers talking to a newer sender. Logging an
+  unexpected nonzero value is reasonable; closing the connection over it
+  is not.
 - New fields are always added at the **end** of an existing message's
   payload in future protocol versions; existing field offsets never change
   within a version. A receiver on an older version simply has a shorter

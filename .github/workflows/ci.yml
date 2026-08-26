@@ -25,6 +25,22 @@ jobs:
       - run: python3 -m venv .venv && .venv/bin/pip install -r home-assistant/requirements-dev.txt
       - run: .venv/bin/python -m pytest home-assistant/tests -q
 
+  integration-tests:
+    # Parent-owned end-to-end test: runs the real Home Assistant add-on and
+    # drives it over a real WebSocket using the *canonical* protocol codec
+    # (not the add-on's vendored copy), proving the two independently-built
+    # implementations actually agree on the wire — see
+    # tests/integration/test_end_to_end.py for why this is distinct from
+    # home-assistant/tests' own (self-consistent but not cross-checked) suite.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python3 -m venv .venv && .venv/bin/pip install -r tests/integration/requirements-dev.txt
+      - run: .venv/bin/python -m pytest tests/integration -q
+
   esp32-host-tests:
     # Protocol-parsing logic is plain C++17 with no ESP-IDF dependency, so it
     # is compiled and tested directly on the runner instead of needing the
