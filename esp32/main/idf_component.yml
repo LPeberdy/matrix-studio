@@ -1,0 +1,22 @@
+## Managed component dependencies, fetched by the IDF component manager on the
+## first `idf.py build` (needs network access once; afterwards they are cached
+## in managed_components/ and pinned by dependencies.lock).
+
+dependencies:
+  # >=5.4, not the >=4.4 that esp-hub75's own manifest claims. Version 0.3.6's
+  # ESP32-S3 GDMA backend uses gdma_channel_alloc_config_t::isr_cache_safe and
+  # gdma_strategy_config_t::eof_till_data_popped, neither of which exists before
+  # ESP-IDF v5.4 — building against v5.3.2 fails to compile. Verified against
+  # v5.5.2, which is also what the component's README lists as tested.
+  idf: ">=5.4"
+
+  # HUB75 DMA driver. Chosen over the more common Arduino-oriented
+  # mrcodetastic/ESP32-HUB75-MatrixPanel-DMA because that library has a
+  # documented, unresolved Wi-Fi/DMA interference issue on ESP32-S3 boards —
+  # exactly the failure mode this project cannot tolerate. It is also what
+  # Waveshare's own ESP-IDF BSP for this board family uses.
+  # See docs/hardware.md "Library and toolchain choice".
+  esphome/esp-hub75: "^0.3.6"
+
+  # WebSocket client. Lives outside esp-idf proper since v5.0.
+  espressif/esp_websocket_client: "^1.2.3"

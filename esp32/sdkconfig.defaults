@@ -1,0 +1,84 @@
+# Project defaults. `idf.py menuconfig` writes user choices to `sdkconfig`,
+# which is gitignored; this file is the committed baseline everyone starts from.
+#
+# Rationale for the non-obvious settings is inline — several of them are the
+# concrete form of the Wi-Fi/DMA mitigation described in docs/hardware.md.
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# --- Flash / partitions ------------------------------------------------------
+# 4MB is the smallest variant this board family ships with; boards with more
+# flash still work. Raise CONFIG_ESPTOOLCHAIN_FLASHSIZE if you want the extra
+# space for OTA later.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# --- PSRAM -------------------------------------------------------------------
+# Enabled so PSRAM is *usable* when present. Nothing in the firmware assumes it
+# exists: psram_info.cpp probes at runtime and every allocation falls back to
+# internal SRAM (docs/hardware.md is explicit that the two candidate board
+# variants disagree about PSRAM, and clones may have none).
+#
+# If your board has quad rather than octal PSRAM, switch
+# CONFIG_SPIRAM_MODE_OCT to CONFIG_SPIRAM_MODE_QUAD in menuconfig. If it has no
+# PSRAM at all, the boot log says so and the firmware carries on.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# Keep small allocations in internal SRAM: the DMA path must never be served
+# from PSRAM by accident.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# Boot continues on boards without PSRAM instead of aborting.
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# --- CPU / scheduling --------------------------------------------------------
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_FREERTOS_HZ=1000
+# Both cores are used on purpose: panel work on one, radio and protocol on the
+# other. See CONFIG_MATRIX_STUDIO_RENDER_CORE / _NETWORK_CORE.
+CONFIG_FREERTOS_UNICORE=n
+
+# --- Wi-Fi -------------------------------------------------------------------
+# Larger RX/TX windows smooth out the ~200KB/s frame stream. Power save is
+# disabled in code (esp_wifi_set_ps(WIFI_PS_NONE)) rather than here so the
+# reason travels with the call.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
+CONFIG_ESP_WIFI_IRAM_OPT=y
+CONFIG_ESP_WIFI_RX_IRAM_OPT=y
+
+# --- lwIP --------------------------------------------------------------------
+CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+CONFIG_LWIP_TCP_MSS=1440
+
+# --- HUB75 driver (esphome/esp-hub75) ---------------------------------------
+# 8-bit colour depth with CIE1931 gamma. Higher depths cost refresh rate; if
+# the panel visibly flickers, come down rather than up.
+CONFIG_HUB75_BIT_DEPTH=8
+CONFIG_HUB75_GAMMA_MODE=1
+
+# --- Console -----------------------------------------------------------------
+# UART0 at 115200, matching `idf.py monitor`'s default. Boards that expose only
+# the native USB port should switch to CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG in
+# menuconfig; serial_console.cpp handles both.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# --- C++ ---------------------------------------------------------------------
+# esp-hub75 requires C++20.
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n
+
+# --- Watchdogs ---------------------------------------------------------------
+# The render task can legitimately hold a core for a whole frame draw.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
