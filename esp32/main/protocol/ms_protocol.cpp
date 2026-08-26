@@ -5,10 +5,6 @@
 namespace matrix_studio {
 namespace {
 
-// All reads go through these helpers, which take the remaining-byte count
-// explicitly. There is no pointer arithmetic on the payload anywhere else in
-// this file, which is what makes the "truncated frame" case structurally
-// impossible to over-read rather than merely tested for.
 class ByteReader {
  public:
   ByteReader(const uint8_t* data, size_t len) : data_(data), len_(len), pos_(0) {}
@@ -23,8 +19,6 @@ class ByteReader {
 
   bool read_u16(uint16_t* out) {
     if (remaining() < 2) return false;
-    // Explicit little-endian assembly (docs/protocol.md §2) rather than a cast,
-    // so the parser is correct on any host the tests happen to run on.
     *out = static_cast<uint16_t>(data_[pos_]) | static_cast<uint16_t>(data_[pos_ + 1] << 8);
     pos_ += 2;
     return true;
@@ -38,8 +32,6 @@ class ByteReader {
     return true;
   }
 
-  // Copies a fixed-width, NUL-padded wire string into a NUL-terminated buffer
-  // of size field_len+1.
   bool read_padded_string(char* out, size_t field_len) {
     if (remaining() < field_len) return false;
     std::memcpy(out, data_ + pos_, field_len);
@@ -85,9 +77,6 @@ class ByteWriter {
     pos_ += n;
   }
 
-  // Writes `s` NUL-padded out to exactly `field_len` bytes. Fails (rather than
-  // silently truncating) if the string does not fit, matching the Python
-  // reference encoder's _pad().
   void write_padded_string(const char* s, size_t field_len) {
     const size_t n = s ? std::strlen(s) : 0;
     if (n > field_len) { ok_ = false; return; }
@@ -110,7 +99,7 @@ void write_header(ByteWriter& w, msp::MessageType type, uint32_t payload_len) {
   w.write_u8(msp::kMagic);
   w.write_u8(msp::kProtocolVersion);
   w.write_u8(static_cast<uint8_t>(type));
-  w.write_u8(0);  // flags reserved, must be 0 in v1
+  w.write_u8(0);
   w.write_u32(payload_len);
 }
 
@@ -124,6 +113,9 @@ bool is_known_type(uint8_t t) {
     case static_cast<uint8_t>(msp::MessageType::kPing):
     case static_cast<uint8_t>(msp::MessageType::kPong):
     case static_cast<uint8_t>(msp::MessageType::kStatus):
+    case static_cast<uint8_t>(msp::MessageType::kOtaBegin):
+    case static_cast<uint8_t>(msp::MessageType::kOtaData):
+    case static_cast<uint8_t>(msp::MessageType::kOtaCommit):
       return true;
     default:
       return false;
@@ -148,9 +140,6 @@ const char* parse_result_name(ParseResult r) {
 }
 
 bool is_fatal(ParseResult r) {
-  // docs/protocol.md §3.5: corruption of the framing itself (magic/version) or
-  // an impossible declared length is fatal to the connection. A malformed but
-  // well-framed individual message is logged and discarded.
   switch (r) {
     case ParseResult::kBadMagic:
     case ParseResult::kUnsupportedVersion:
@@ -174,9 +163,6 @@ bool status_code_for(ParseResult r, msp::StatusCode* out_code) {
     case ParseResult::kMalformedPayload:
       *out_code = msp::StatusCode::kErrMalformedPayload;
       return true;
-    // kLengthTooLarge deliberately produces no STATUS: §3.5(4) says to close
-    // the connection without reading the declared payload, and does not ask
-    // for a reply.
     default:
       return false;
   }
@@ -194,12 +180,8 @@ ParseResult parse_message(const uint8_t* buf, size_t len, Message& out) {
   (void)header_reader.read_u8(&out.header.flags);
   (void)header_reader.read_u32(&out.header.length);
 
-  // §3.5(1)
   if (out.header.magic != msp::kMagic) return ParseResult::kBadMagic;
-  // §3.5(2)
   if (out.header.version != msp::kProtocolVersion) return ParseResult::kUnsupportedVersion;
-  // §3.5(4) — checked before slicing so an absurd length can never be used to
-  // compute a payload pointer.
   if (out.header.length > msp::kMaxPayloadBytes) return ParseResult::kLengthTooLarge;
 
   out.total_size = msp::kHeaderSizeBytes + static_cast<size_t>(out.header.length);
@@ -208,7 +190,6 @@ ParseResult parse_message(const uint8_t* buf, size_t len, Message& out) {
   out.payload = buf + msp::kHeaderSizeBytes;
   out.payload_len = out.header.length;
 
-  // §3.5(3)
   if (!is_known_type(out.header.type)) {
     return is_extension_type(out.header.type) ? ParseResult::kExtensionType : ParseResult::kUnknownType;
   }
@@ -242,15 +223,9 @@ ParseResult parse_message(const uint8_t* buf, size_t len, Message& out) {
       if (!r.read_u16(&out.frame.height)) return ParseResult::kMalformedPayload;
       if (!r.read_u8(&out.frame.pixel_format)) return ParseResult::kMalformedPayload;
       if (!r.read_u8(&out.frame.reserved)) return ParseResult::kMalformedPayload;
-
-      // Only RGB565 is defined in v1; anything else has an unknown stride, so
-      // refuse to compute a pixel count from it.
       if (out.frame.pixel_format != static_cast<uint8_t>(msp::PixelFormat::kRgb565)) {
         return ParseResult::kMalformedPayload;
       }
-      // Computed in size_t after the u16 fields have been range-limited by
-      // their own width, so this cannot overflow (65535*65535*2 fits in 64-bit
-      // and is in any case far above kMaxPayloadBytes, caught below).
       const size_t expected = static_cast<size_t>(out.frame.width) * static_cast<size_t>(out.frame.height) * 2u;
       if (r.remaining() != expected) return ParseResult::kMalformedPayload;
       out.frame.pixels = r.cursor();
@@ -286,6 +261,23 @@ ParseResult parse_message(const uint8_t* buf, size_t len, Message& out) {
       out.status.text_len = r.remaining();
       return ParseResult::kOk;
     }
+    case msp::MessageType::kOtaBegin: {
+      if (out.payload_len != msp::kOtaBeginPayloadLen) return ParseResult::kMalformedPayload;
+      if (!r.read_u32(&out.ota_image_size) || out.ota_image_size == 0) return ParseResult::kMalformedPayload;
+      return ParseResult::kOk;
+    }
+    case msp::MessageType::kOtaData: {
+      if (out.payload_len <= msp::kOtaDataFixedFieldsLen ||
+          out.payload_len > msp::kOtaDataFixedFieldsLen + msp::kOtaMaxChunkBytes) {
+        return ParseResult::kMalformedPayload;
+      }
+      if (!r.read_u32(&out.ota_data.offset)) return ParseResult::kMalformedPayload;
+      out.ota_data.data = r.cursor();
+      out.ota_data.data_len = r.remaining();
+      return ParseResult::kOk;
+    }
+    case msp::MessageType::kOtaCommit:
+      return out.payload_len == msp::kOtaCommitPayloadLen ? ParseResult::kOk : ParseResult::kMalformedPayload;
   }
   return ParseResult::kUnknownType;
 }
