@@ -293,7 +293,20 @@ Status codes:
 | Default WebSocket port         | 7887    |
 | Default WebSocket path         | `/matrix-studio` |
 
-## 7. Golden fixtures
+## 7. Known operational risk: Wi-Fi/DMA interference
+
+Hardware research (`docs/hardware.md`) found a documented risk that the
+HUB75 DMA engine's high-frequency output can disturb the ESP32-S3's Wi-Fi
+radio on some boards, surfacing as connection stalls. This protocol was
+deliberately **not** redesigned around UDP to pre-empt that risk: the
+existing heartbeat/timeout/reconnect rules in §3.1 and §3.3 already turn a
+stalled connection into an automatic reconnect rather than a wedged device,
+which is an adequate mitigation for v1. If real-hardware testing shows this
+is insufficient, that is a candidate reason for a deliberate, parent-agent-
+reviewed protocol revision later — not something either side should route
+around unilaterally.
+
+## 8. Golden fixtures
 
 See [`protocol/fixtures/`](../protocol/fixtures/) and its `manifest.json` for
 byte-exact test vectors covering: valid `HELLO`, valid 64x64 `FRAME`, valid

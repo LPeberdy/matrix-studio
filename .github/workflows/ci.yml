@@ -26,21 +26,24 @@ jobs:
       - run: .venv/bin/python -m pytest home-assistant/tests -q
 
   esp32-host-tests:
+    # Protocol-parsing logic is plain C++17 with no ESP-IDF dependency, so it
+    # is compiled and tested directly on the runner instead of needing the
+    # full ESP-IDF toolchain used for esp32-firmware-build below.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install -U platformio
-      - run: cd esp32 && pio test -e native
+      - run: cd esp32/tests && cmake -B build && cmake --build build
+      - run: cd esp32/tests && ctest --test-dir build --output-on-failure
 
   esp32-firmware-build:
+    # Firmware targets ESP-IDF (not PlatformIO/Arduino) — see docs/hardware.md
+    # for why: the esp-hub75 component + direct Wi-Fi tuning knobs are used
+    # to mitigate a known Wi-Fi/DMA interference risk on ESP32-S3 HUB75 boards.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: espressif/esp-idf-ci-action@v1
         with:
-          python-version: "3.11"
-      - run: pip install -U platformio
-      - run: cd esp32 && pio run -e esp32-s3-hub75
+          esp_idf_version: v5.3
+          target: esp32s3
+          path: esp32
