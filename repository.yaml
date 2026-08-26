@@ -1,0 +1,13 @@
+# Home Assistant Supervisor add-on repository manifest.
+# Reference: https://developers.home-assistant.io/docs/add-ons/repository
+#
+# This lets a Home Assistant OS/Supervised instance add this whole GitHub
+# repository as an add-on store repository (Settings > Add-ons > Add-on
+# store > (...) > Repositories > add this repo's URL) and then install the
+# "Matrix Studio" add-on defined in home-assistant/ directly, with no local
+# file copy required. Supervisor discovers add-ons by scanning immediate
+# subdirectories of the repository for a config.yaml/config.json — that is
+# home-assistant/ here.
+name: Matrix Studio
+url: https://github.com/LPeberdy/matrix-studio
+maintainer: Laurence Peberdy
