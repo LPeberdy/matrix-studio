@@ -1,66 +1,93 @@
 ---
 name: matrix-studio-scenes
-description: Create or deploy Matrix Studio user scenes for the 64x64 HUB75 display. Use when a request involves a Matrix Studio scene or the add-on's config/scenes directory.
+description: Create, install, or change generative scenes for the user's Matrix Studio 64x64 LED display through Home Assistant. Use when the user asks for a Matrix Studio visual, animation, scene, generative artwork, or a scene that reacts to Home Assistant state.
 ---
 
 # Matrix Studio scenes
 
-Treat the repo and the running add-on as the source of truth. Read `home-assistant/example_scenes/README.txt` and the closest existing scene before writing code.
+Matrix Studio is a Home Assistant add-on that renders animated `64x64` RGB frames and streams them to an ESP32-driven HUB75 LED panel. Scene code runs inside Matrix Studio on the Home Assistant machine; the display receives the rendered frames.
 
-## 1. Resolve the scene
+Home Assistant MCP is the control plane. Work through Matrix Studio's public scene contract and add-on API.
 
-Establish the scene name, visual behaviour, and whether it needs Home Assistant state. If deploying, inspect the Matrix Studio add-on options and resolve its configured `scenes_dir` rather than guessing a host path.
+## 1. Design the scene
 
-**Complete when:** the target filename, behaviour, state inputs, and destination directory are known.
+Turn the user's visual reference into a small generative system suited to a 64x64 display. Preserve the important visual behaviours rather than trying to reproduce fine detail that cannot survive at this resolution.
 
-## 2. Build one user-scene file
+Decide whether the scene is:
 
-Write a single `.py` file. User scenes are loaded by filename, and a filename matching a built-in scene intentionally shadows that built-in.
+- purely time-driven; or
+- reactive to Home Assistant state.
 
-Use the public API via absolute imports, for example:
+When the request refers to specific devices or sensors, use Home Assistant MCP to resolve their real entity IDs before writing the scene.
+
+**Complete when:** the visual behaviour, scene name, and any Home Assistant inputs are explicit.
+
+## 2. Write the scene source
+
+A user scene is one Python module. The simplest shape is:
 
 ```python
-from matrix_studio.scene_api import Controls, HomeState
 from PIL import Image
+from matrix_studio.scene_api import Controls, HomeState
 
 
 def render(t: float, home: HomeState, controls: Controls) -> Image.Image:
     ...
 ```
 
-A scene must return a `64x64` RGB `PIL.Image.Image`. Keep `render()` non-blocking and suitable for a 24 FPS loop. Put persistent animation state on a scene object when needed. Prefer NumPy for whole-frame pixel work. Home Assistant data comes from the provided `home` snapshot; do not perform network I/O from the scene.
+`render()` is called repeatedly, normally around 24 FPS, and should return a `64x64` RGB `PIL.Image.Image`.
 
-**Complete when:** importing the file succeeds and repeated renders return `64x64` RGB images without blocking or raising.
+NumPy and Pillow are available. Keep rendering fast and self-contained: compute from `t`, the supplied `home` snapshot, `controls`, and in-memory state. For simulations that need persistent state, define a `Scene` subclass and expose an instance as `SCENE`.
 
-## 3. Validate
+Useful Home Assistant inputs:
 
-With a repo checkout, use the real preview path:
+- `home.available`
+- `home.lights_on`
+- `home.lights_total`
+- `home.lights_on_fraction`
+- `home.indoor_temperature`
+- `home.outdoor_temperature`
+- `home.weather`
+- `home.occupied`
+- `home.get("domain.entity_id")` → entity with `.state`, `.attributes`, `.is_on`, `.numeric`
 
-```sh
-cd home-assistant
-python -m matrix_studio.preview --scene <scene-name> --scenes-dir <directory-containing-the-file> --out /tmp/<scene-name>.png
+Home Assistant state is already supplied to the scene. Use it rather than making network calls from `render()`.
+
+**Complete when:** the source is a self-contained Matrix Studio scene and every render path produces a usable image.
+
+## 3. Install and enable it through Home Assistant MCP
+
+Use the Home Assistant MCP tools available in the chat:
+
+1. Find the installed add-on with `ha_get_addon(source="installed")` and select **Matrix Studio**. Keep its returned `slug`.
+2. Inspect the running add-on with `ha_manage_addon(slug=<slug>, path="/api/status")`.
+3. Install the scene through Matrix Studio's API:
+
+```text
+ha_manage_addon(
+  slug=<slug>,
+  path="/api/scenes/<scene_name>",
+  method="PUT",
+  body={
+    "source": <complete Python source>,
+    "activate": true
+  }
+)
 ```
 
-For a state-reactive scene, also inspect the existing scene tests and exercise representative `HomeState` values.
+Matrix Studio owns scene persistence, reload and validation. A successful new install returns HTTP 201; replacing an existing user scene returns 200. A failed import is rejected and the previous working version is restored.
 
-**Complete when:** the scene loads through Matrix Studio's loader and renders a representative frame successfully.
+4. Read `/api/status` again. Confirm:
+   - the scene is listed with `source: "user"` and `ok: true`;
+   - `controls.active_scene` is the new scene;
+   - after a few rendered frames, it is not listed in `engine.quarantined`.
 
-## 4. Deploy through Home Assistant MCP
+If the user wants this scene to remain the startup default after add-on restarts, update the Matrix Studio add-on option `active_scene` through `ha_manage_addon`, then restart only the Matrix Studio add-on.
 
-Use Home Assistant MCP to read the Matrix Studio add-on configuration first. Resolve `scenes_dir`, then use the MCP's file/add-on write capability to create `<scenes_dir>/<scene-name>.py` with the validated source. Complete any Home Assistant approval flow the MCP presents, then retry the write.
+**Complete when:** the running add-on reports the scene healthy and active.
 
-Matrix Studio normally hot-reloads the directory. Verify the running add-on status shows the scene with `source=user` and `ok=true`. If it has not reloaded, trigger **Reload scenes** in the Matrix Studio ingress UI.
+## 4. Iterate visually
 
-Enable the scene by selecting it in the Matrix Studio **Scene** control. To make it the persistent startup scene, use Home Assistant MCP to set the add-on option `active_scene` to the same name and restart the add-on.
+Treat the first installation as a live draft. Use the Matrix Studio preview/status surface and the user's feedback to adjust motion, density, palette, tempo, contrast, or Home Assistant responsiveness. Reinstall the same scene name through the same API to replace it in place.
 
-**Complete when:** the running add-on reports the user scene healthy, `active_scene` is the requested scene, and the ingress preview is rendering it.
-
-## Example: deploy `glitch_life`
-
-1. Read the add-on config with Home Assistant MCP and confirm `scenes_dir` (normally `/config/scenes` inside the add-on).
-2. Write the validated source to `<scenes_dir>/glitch_life.py` through Home Assistant MCP.
-3. Wait for hot reload or press **Reload scenes**.
-4. Check status: `glitch_life`, `source=user`, `ok=true`.
-5. Select `glitch_life` in the Scene control.
-6. If it should survive restarts as the default, set add-on option `active_scene: glitch_life` through Home Assistant MCP and restart Matrix Studio.
-7. Confirm the ingress preview is visibly updating.
+Keep normal scene work at this scene/API layer.
