@@ -71,6 +71,9 @@ extern "C" void app_main(void) {
     ESP_LOGE(TAG, "the panel failed to start. The firmware keeps running so the serial log stays "
                   "usable, but nothing will be displayed. Check main/board_config.h and the "
                   "wiring table in docs/hardware.md.");
+    // On a factory/USB boot this is non-fatal so diagnostics remain available.
+    // On a just-installed OTA image it is a failed validation and rolls back.
+    matrix_studio::ota::finish_boot_validation(false);
   }
 
   ESP_ERROR_CHECK(g_frames.init(matrix_studio::board::kFrameBytes));
