@@ -22,3 +22,6 @@ esp32/wifi_secrets.h
 
 # Node (ingress UI tooling, if any)
 node_modules/
+
+# Claude Code agent worktrees/state (never part of the project)
+.claude/
