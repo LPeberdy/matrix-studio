@@ -36,10 +36,9 @@ add-on happily runs with no device attached.
 
 ## Your own scenes
 
-Scene files live in the add-on's config folder, visible on the host as
-`/addon_configs/<slug>_matrix_studio/scenes/` (via the *File editor*, *Samba*
-or *Terminal & SSH* add-ons). Two examples and a full authoring guide
-(`README.txt`) are placed there the first time the add-on starts.
+User scenes are persistent add-on configuration. The repository ships starter
+scenes, but adding or changing your own scene does not require rebuilding the
+add-on.
 
 The shortest possible scene:
 
@@ -51,9 +50,41 @@ def render(t, home, controls):
     return Image.new("RGB", (64, 64), (level, 0, 255 - level))
 ```
 
-Save it, and it appears in the scene picker within a couple of seconds — no
-restart. If it crashes, the add-on logs the traceback, keeps running, and falls
-back to another scene; the ingress page shows the error.
+### Through the Matrix Studio API
+
+The ingress API is the preferred programmatic interface for agents and other
+Home Assistant tooling. Create or replace a scene with:
+
+```http
+PUT /api/scenes/my_scene
+Content-Type: application/json
+
+{
+  "source": "<complete Python source>",
+  "activate": true
+}
+```
+
+Matrix Studio writes the scene into its configured persistent scene directory,
+reloads it, rejects import failures, restores the previous version after a
+failed replacement, and optionally makes it active. `GET /api/status` reports
+every scene's `source`, load health and the current `active_scene`.
+
+Home Assistant MCP clients can reach this endpoint through their add-on proxy,
+so they do not need direct filesystem access to Matrix Studio's private config
+volume.
+
+### Manually
+
+Scene files live in the add-on's config folder, visible on the host as
+`/addon_configs/<slug>_matrix_studio/scenes/` (via the *File editor*, *Samba*
+or *Terminal & SSH* add-ons). Bundled starter files and an authoring guide
+(`README.txt`) are copied there when missing; existing user files are never
+overwritten.
+
+Save a `.py` file there and it appears in the scene picker within a couple of
+seconds — no restart. If it crashes, the add-on logs the traceback, keeps
+running, and falls back to another scene; the ingress page shows the error.
 
 To check panel wiring, pick the **testcard** scene: colour bars, per-channel
 ramps, a 1 px border and four distinct corner pixels (red = top-left,
@@ -66,7 +97,7 @@ green = top-right, blue = bottom-left, white = bottom-right).
 | Device never connects | The add-on must be reachable on port 7887 from the device's VLAN; check the *Network* panel and any firewall between them |
 | "No Supervisor token" warning | `homeassistant_api: true` must be set (it is by default); restart the add-on |
 | Home Assistant state shown as stale | See the add-on log for the API error; rendering continues with the last known values |
-| Scene quarantined | Fix the file, then press **Reload scenes** |
+| Scene quarantined | Fix or replace the scene, then press **Reload scenes** |
 | Low FPS | Lower `target_fps`, or simplify the scene; the status panel shows per-frame render time |
 | Panel colours wrong / mirrored | Use the **testcard** scene and check the firmware's `board_config.h` |
 

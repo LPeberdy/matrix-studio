@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import logging
 import pathlib
+import re
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -31,6 +32,8 @@ _LOGGER = logging.getLogger(__name__)
 
 STATIC_DIR = pathlib.Path(__file__).parent / "static"
 MAX_PREVIEW_SCALE = 8
+MAX_SCENE_SOURCE_BYTES = 128 * 1024
+_SCENE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 class IngressWeb:
@@ -53,6 +56,8 @@ class IngressWeb:
         app.router.add_get("/api/status", self.status)
         app.router.add_get("/api/preview.png", self.preview_png)
         app.router.add_post("/api/scene", self.set_scene)
+        app.router.add_put("/api/scenes/{name}", self.install_scene)
+        app.router.add_post("/api/scenes/{name}", self.install_scene)
         app.router.add_post("/api/brightness", self.set_brightness)
         app.router.add_post("/api/blank", self.set_blank)
         app.router.add_post("/api/reload", self.reload_scenes)
@@ -125,6 +130,91 @@ class IngressWeb:
         if not self.studio.set_scene(name):
             return web.json_response({"ok": False, "error": f"unknown scene {name!r}"}, status=400)
         return web.json_response({"ok": True, "active_scene": self.studio.controls.active_scene})
+
+    async def install_scene(self, request: web.Request) -> web.Response:
+        """Create or replace one user scene in the add-on's persistent config.
+
+        This is the stable agent-facing write surface. Callers provide scene
+        source, not filesystem paths; Matrix Studio owns where the file lives,
+        reloads it, validates that the loader accepts it, and can activate it.
+        """
+        name = request.match_info.get("name", "").strip()
+        if not _SCENE_NAME.fullmatch(name):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "scene name must match ^[a-z][a-z0-9_]{0,63}$",
+                },
+                status=400,
+            )
+
+        body = await self._json(request)
+        source = body.get("source")
+        if not isinstance(source, str) or not source.strip():
+            return web.json_response({"ok": False, "error": "source must be a non-empty string"}, status=400)
+        if len(source.encode("utf-8")) > MAX_SCENE_SOURCE_BYTES:
+            return web.json_response(
+                {"ok": False, "error": f"scene source exceeds {MAX_SCENE_SOURCE_BYTES} bytes"},
+                status=413,
+            )
+
+        # Catch syntax errors before touching the current file.
+        try:
+            compile(source, f"{name}.py", "exec")
+        except SyntaxError as exc:
+            return web.json_response(
+                {"ok": False, "error": f"scene syntax error: {exc.msg} (line {exc.lineno})"},
+                status=400,
+            )
+
+        directory = pathlib.Path(self.studio.options.scenes_dir)
+        destination = directory / f"{name}.py"
+        temporary = directory / f".{name}.py.tmp"
+        previous = destination.read_bytes() if destination.exists() else None
+        created = previous is None
+
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(source, encoding="utf-8")
+            temporary.replace(destination)
+            self.studio.reload_scenes()
+
+            entry = self.studio.registry.get(name)
+            if entry is None or not entry.ok:
+                detail = entry.error if entry is not None else "scene was not discovered after reload"
+                raise ValueError(detail)
+        except Exception as exc:  # noqa: BLE001 - failed installs must roll back atomically
+            temporary.unlink(missing_ok=True)
+            try:
+                if previous is None:
+                    destination.unlink(missing_ok=True)
+                else:
+                    destination.write_bytes(previous)
+                self.studio.reload_scenes()
+            except OSError:
+                _LOGGER.exception("failed to roll back scene %r after install error", name)
+            return web.json_response({"ok": False, "error": f"scene failed to load: {exc}"}, status=400)
+
+        activated = bool(body.get("activate", False))
+        if activated and not self.studio.set_scene(name):
+            return web.json_response(
+                {"ok": False, "error": "scene loaded but could not be activated"},
+                status=409,
+            )
+
+        entry = self.studio.registry.get(name)
+        return web.json_response(
+            {
+                "ok": True,
+                "name": name,
+                "created": created,
+                "source": "user",
+                "description": entry.description if entry is not None else "",
+                "activated": activated,
+                "active_scene": self.studio.controls.active_scene,
+            },
+            status=201 if created else 200,
+        )
 
     async def set_brightness(self, request: web.Request) -> web.Response:
         body = await self._json(request)
