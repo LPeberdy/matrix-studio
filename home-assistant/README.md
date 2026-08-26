@@ -1,0 +1,152 @@
+# Matrix Studio — Home Assistant add-on
+
+The Home Assistant half of Matrix Studio. It renders generative scenes at a
+fixed cadence, converts each frame to RGB565, and streams it to one or more
+ESP32-S3 HUB75 controllers over a WebSocket using
+[Protocol v1](../docs/protocol.md).
+
+This is a **Supervisor add-on** (a container Supervisor builds and runs), not a
+custom integration and not a HACS component.
+
+```
+options ──▶ SceneEngine ──▶ FrameBus ──▶ DeviceServer :7887  ──▶ ESP32
+              ▲                  │        (Protocol v1 WebSocket)
+              │                  └──────▶ IngressWeb :8099  ──▶ browser preview
+        HaStateAdapter
+    (http://supervisor/core/api)
+```
+
+## Layout
+
+| Path | What it is |
+|---|---|
+| `config.yaml` | Add-on manifest: options, schema, ports, ingress |
+| `build.yaml` | Per-architecture base images |
+| `Dockerfile` / `run.sh` | Image build and entrypoint |
+| `matrix_studio/app.py` | Composition root; wires everything together |
+| `matrix_studio/engine.py` | Fixed-cadence render loop + broken-scene fallback |
+| `matrix_studio/server.py` | Protocol v1 WebSocket server |
+| `matrix_studio/ha_state.py` | Home Assistant state adapter (Supervisor proxy) |
+| `matrix_studio/loader.py` | Scene discovery, loading, hot reload |
+| `matrix_studio/framebuffer.py` | RGB565 conversion + latest-frame fan-out |
+| `matrix_studio/web.py` + `static/` | Ingress UI and preview endpoints |
+| `matrix_studio/preview.py` | Emulator / preview CLI (no hardware needed) |
+| `matrix_studio/scenes/` | Built-in scenes |
+| `matrix_studio/vendor/` | Verbatim copy of the frozen protocol codec |
+| `example_scenes/` | Seeded into the user's scenes directory on first run |
+| `tests/` | pytest suite |
+
+### Why the protocol codec is vendored
+
+Supervisor builds an add-on with **the add-on directory as the Docker build
+context**, so `../protocol/matrix_studio_protocol.py` does not exist at image
+build time. `matrix_studio/vendor/matrix_studio_protocol.py` is a byte-for-byte
+copy, and `tests/test_protocol_contract.py` fails if it ever drifts. Re-sync
+after any (rare) protocol change:
+
+```sh
+python3 home-assistant/tools/sync_protocol.py          # copy
+python3 home-assistant/tools/sync_protocol.py --check  # verify only
+```
+
+No module outside `vendor/` is allowed to know the wire format — a test
+enforces that too.
+
+## Installing on Home Assistant OS
+
+Supervisor can only install add-ons from a directory it can see. Two options:
+
+### A. Local add-on (fastest, no publishing)
+
+1. Copy this directory onto the HA host as `/addons/matrix_studio` — i.e. the
+   share exposed by the *Samba share* add-on as `\\<host>\addons\`, or via the
+   *Terminal & SSH* add-on / `ha` CLI. The folder must contain `config.yaml`
+   at its top level.
+2. **Settings → Add-ons → Add-on store → ⋮ → Check for updates.**
+3. "Matrix Studio" appears under **Local add-ons**. Open it → **Install**
+   (Supervisor builds the image from `Dockerfile`; a few minutes the first time).
+4. **Configuration** tab: set your entity ids (see below), then **Start**.
+5. Enable **Show in sidebar** to reach the ingress UI.
+
+### B. Add-on repository
+
+Push a repo containing a `repository.yaml` plus this directory, then
+**Add-on store → ⋮ → Repositories → Add** the URL. Supervisor still builds
+locally because `config.yaml` declares no prebuilt `image:`.
+
+### Configuration
+
+| Option | Default | Notes |
+|---|---|---|
+| `active_scene` | `plasma` | Scene to start on; also settable from the UI |
+| `target_fps` | `24` | 1-60. ~24 uses ≈7 ms/frame on a Pi 5 |
+| `brightness` | `160` | 0-255, sent to the device as `BRIGHTNESS` |
+| `blank` | `false` | Start with the panel blanked |
+| `scenes_dir` | `/config/scenes` | Inside the container. On the host this is `/addon_configs/<slug>_matrix_studio/scenes` |
+| `ws_port` | `7887` | Container-internal listen port — see the caveat below |
+| `ws_path` | `/matrix-studio` | Must match the firmware |
+| `state_poll_interval` | `5` | Seconds between Home Assistant state polls |
+| `hot_reload` | `true` | Watch `scenes_dir` and reload changed files |
+| `auto_discover_lights` | `true` | When `entities.lights` is empty, track every `light.` entity |
+| `log_level` | `info` | |
+| `entities.lights` | `[]` | Explicit list of light entity ids |
+| `entities.indoor_temperature` | – | e.g. `sensor.living_room_temperature` |
+| `entities.outdoor_temperature` | – | e.g. `sensor.outside_temperature` |
+| `entities.weather` | – | e.g. `weather.home` |
+| `entities.occupancy` | – | e.g. `binary_sensor.someone_home` |
+
+No entity ids are hardcoded anywhere in this add-on; scenes only ever see what
+you configure (plus auto-discovered lights, if enabled).
+
+> **`ws_port` caveat.** `config.yaml` publishes container port `7887`. Changing
+> `ws_port` changes what the *container* listens on, which then no longer
+> matches the published port. To use a different port on the LAN, leave
+> `ws_port` at `7887` and remap the **host** side in the add-on's *Network*
+> panel instead. The add-on logs a warning if you change it.
+
+### Point the device at it
+
+The ESP32 connects out to
+`ws://<home-assistant-host>:7887/matrix-studio`. The add-on never connects to
+the device, so no inbound rule on the ESP32 side is needed. Zero connected
+devices is a normal, healthy state — the add-on keeps rendering regardless.
+
+## Writing scenes
+
+A scene is anything with `render(t, home, controls) -> PIL.Image.Image`
+returning a 64x64 RGB image. Drop `.py` files into `scenes_dir`; they are
+picked up without restarting the add-on. Full authoring notes, including the
+`HomeState` API, are in [`example_scenes/README.txt`](example_scenes/README.txt),
+which is copied into your scenes directory on first run.
+
+If a scene raises, the engine logs it and renders a fallback scene instead;
+after three consecutive failures the scene is quarantined until you fix it and
+press **Reload scenes**. The add-on itself never goes down because of a scene.
+
+Built-in scenes: `plasma` (colour test), `starfield`, `landscape`,
+`home_pulse` (reacts to Home Assistant), `testcard` (panel wiring check).
+
+## Development
+
+```sh
+cd home-assistant
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest tests -q
+```
+
+Preview scenes with no hardware and no Home Assistant:
+
+```sh
+.venv/bin/python -m matrix_studio.preview --list
+.venv/bin/python -m matrix_studio.preview --scene landscape --out /tmp/frame.png
+.venv/bin/python -m matrix_studio.preview --scene starfield --frames 90 --gif /tmp/out.gif
+.venv/bin/python -m matrix_studio.preview --serve                  # browser preview on :8099
+.venv/bin/python -m matrix_studio.preview --serve --device-server  # + real :7887 endpoint
+```
+
+`--serve --device-server` runs the genuine Protocol v1 endpoint, so firmware
+can be developed against a laptop before the add-on is installed. Feed scenes
+real data with `--home-state states.json` (a dump of `/api/states`).
+
+Preview output is round-tripped through RGB565, so what you see is what the
+panel shows, quantisation included.

@@ -1,0 +1,87 @@
+# Home Assistant Supervisor add-on manifest.
+# Reference: https://developers.home-assistant.io/docs/add-ons/configuration
+name: Matrix Studio
+version: "0.1.0"
+slug: matrix_studio
+description: >-
+  Streams generative-art frames from Home Assistant to an ESP32-S3 HUB75 LED
+  matrix over Wi-Fi using Matrix Studio Protocol v1.
+url: https://github.com/LPeberdy/matrix-studio
+codenotary: null
+
+# armv7 is deliberately excluded: numpy publishes no musllinux armv7 wheels,
+# so the image would have to compile it from source on the device.
+arch:
+  - aarch64
+  - amd64
+
+# The HA base images already ship s6-overlay, so Supervisor must not inject
+# its own init.
+init: false
+startup: application
+boot: auto
+
+# Read Home Assistant state through the Supervisor proxy at
+# http://supervisor/core/api using the injected SUPERVISOR_TOKEN.
+homeassistant_api: true
+
+# /config inside the container is this add-on's own persistent config folder
+# (/addon_configs/<slug>_matrix_studio on the host), editable from the File
+# editor / Samba add-ons. User scene files live there.
+map:
+  - addon_config:rw
+
+# The ESP32 is the WebSocket *client* (docs/protocol.md §1), so this port must
+# be reachable on the LAN. The container always listens on 7887; remap the host
+# side here or in the add-on's Network panel if 7887 is already taken.
+ports:
+  7887/tcp: 7887
+ports_description:
+  7887/tcp: Matrix Studio Protocol v1 WebSocket endpoint for the ESP32 device
+
+# Supervisor restarts the add-on if the device endpoint stops accepting TCP.
+watchdog: tcp://[HOST]:[PORT:7887]
+
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:view-grid
+panel_title: Matrix Studio
+
+options:
+  active_scene: plasma
+  target_fps: 24
+  brightness: 160
+  blank: false
+  scenes_dir: /config/scenes
+  ws_port: 7887
+  ws_path: /matrix-studio
+  state_poll_interval: 5
+  hot_reload: true
+  auto_discover_lights: true
+  log_level: info
+  entities:
+    lights: []
+    indoor_temperature: ""
+    outdoor_temperature: ""
+    weather: ""
+    occupancy: ""
+
+schema:
+  active_scene: str
+  target_fps: int(1,60)
+  brightness: int(0,255)
+  blank: bool
+  scenes_dir: str
+  ws_port: port
+  ws_path: str
+  state_poll_interval: int(1,3600)
+  hot_reload: bool
+  auto_discover_lights: bool
+  log_level: list(trace|debug|info|notice|warning|error|fatal)
+  entities:
+    lights:
+      - str
+    indoor_temperature: str?
+    outdoor_temperature: str?
+    weather: str?
+    occupancy: str?
