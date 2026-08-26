@@ -5,15 +5,14 @@ Home Assistant add-on. The ESP32-S3 joins Wi-Fi, opens a persistent WebSocket
 to `ws://<host>:7887/matrix-studio`, performs the Protocol v1 handshake, and
 renders incoming RGB565 frames with HUB75 DMA.
 
-The frozen wire contract is [`docs/protocol.md`](../docs/protocol.md). Hardware
-facts and bring-up evidence live in [`docs/hardware.md`](../docs/hardware.md).
+The authoritative wire contract is [`docs/protocol.md`](../docs/protocol.md).
+Hardware facts and bring-up evidence live in
+[`docs/hardware.md`](../docs/hardware.md).
 
 > **Current physical target:** Hengantech-branded controller matching Seengreat
 > `RGB Matrix HUB75 S3`, plus a Seengreat P3 64x64 / 1/32-scan panel. The GPIO
 > map is vendor-documented and the physical panel photographs show FM6124EJ
 > driver ICs. The complete combination has not yet been bench-verified.
-
----
 
 ## Known hardware configuration
 
@@ -56,9 +55,6 @@ mirrored in [`main/board_config.h`](main/board_config.h):
 | E  | 16 | | CLK | 12 |
 | LAT| 11 | | OE  | 13 |
 
-The old Waveshare-derived defaults were not suitable for this controller: only
-`B1 = GPIO6` matched.
-
 Current panel settings:
 
 ```cpp
@@ -72,21 +68,17 @@ constexpr uint8_t kDefaultBrightness = 90;  // ~35%
 The scan wiring, colour order, clock speed and latch blanking still require
 physical confirmation.
 
----
-
 ## Requirements
 
 | | |
 |---|---|
 | Controller | Hengantech / Seengreat-compatible RGB Matrix HUB75 S3 |
 | Panel | P3 64x64 HUB75, 1/32 scan |
-| Runtime power | Regulated 5 V USB-C source suitable for the controller/panel load |
+| Runtime power | Regulated 5 V USB-C source suitable for controller/panel load |
 | Toolchain | ESP-IDF **v5.5.2 or newer** |
 | Flash host | macOS, Linux or Windows |
 
-Do not use Arduino or PlatformIO for Matrix Studio firmware.
-
----
+Do not use Arduino or PlatformIO.
 
 ## Toolchain setup
 
@@ -111,11 +103,6 @@ idf.py --version
 
 The version should be `v5.5.2` or newer.
 
-The first build downloads the pinned `esp-hub75` and
-`esp_websocket_client` components. Subsequent builds use the cached versions.
-
----
-
 ## Wi-Fi and server configuration
 
 From `esp32/`:
@@ -134,12 +121,7 @@ Edit `main/wifi_secrets.h` with:
 `main/wifi_secrets.h` is gitignored. **Never commit or paste its contents into
 logs, issues, or pull requests.**
 
-The equivalent settings are also available through `idf.py menuconfig`, but the
-local secrets header is recommended because `sdkconfig` is not a secrets file.
-
----
-
-## Build and flash
+## Build and first flash
 
 For the first flash, the panel does not need to be connected or powered.
 
@@ -162,7 +144,7 @@ Then:
 idf.py -p <PORT> flash monitor
 ```
 
-Exit the monitor with **Ctrl-]**.
+Exit monitor with **Ctrl-]**.
 
 If automatic download mode fails:
 
@@ -171,14 +153,33 @@ If automatic download mode fails:
 3. release **BOOT**
 4. retry `idf.py -p <PORT> flash`
 
-A normal USB-C connection is used for flashing/debugging. The Mac/PC is not
-part of the deployed system once firmware is installed.
+The first wired image already contains Matrix Studio's OTA partition layout and
+OTA receiver. USB remains available as a recovery path, but routine later
+firmware updates do not require another cable flash.
 
----
+### OTA-capable partition layout
+
+The documented controller has 16 MB flash. `partitions.csv` provides:
+
+```text
+factory   3 MB
+ota_0     3 MB
+ota_1     3 MB
+otadata
+nvs
+phy_init
+```
+
+Bootloader application rollback is enabled. A firmware image installed over
+Wi-Fi is selected only after ESP-IDF validates it, then remains pending until
+Matrix Studio successfully initializes its core subsystems on the next boot.
+If that startup path fails, ESP-IDF rolls back to the previous image.
+
+OTA uses ordinary Protocol v1 messages on the same WebSocket connection:
+`OTA_BEGIN`, sequential `OTA_DATA` chunks, then `OTA_COMMIT`. See
+[`docs/protocol.md`](../docs/protocol.md) for the exact contract.
 
 ## Normal deployed wiring and power
-
-The normal setup is:
 
 ```text
 5 V USB-C supply
@@ -191,37 +192,25 @@ ESP32-S3 HUB75 controller
 Home Assistant Pi <-- Wi-Fi --> ESP32-S3
 ```
 
-The HUB75 ribbon carries display signals and ground. **It does not carry the
-panel's LED operating power.** The separate VH-4P cable supplies that power.
+The controller distributes panel power through its VH-4P output. The HUB75
+ribbon carries signals and ground, not the LED operating supply.
 
-The controller is designed to distribute panel power: Seengreat rates its
-VH-4P output to a maximum of 5 V / 4 A, and the P3 64x64 panel is itself
-specified at 5 V / 4 A. Controller-powered operation is therefore the intended
-baseline for this hardware pair.
-
-For first bring-up, keep the firmware at the default ~35% brightness. Do not
-start with sustained full-white / full-brightness output. If high-brightness
-operation later produces resets or corruption, establish the practical limit
-and use the controller's dedicated matrix-power input or a higher-margin direct
-panel supply if needed.
-
----
+Seengreat rates the controller VH-4P output to 5 V / 4 A and specifies the P3
+64x64 panel at 5 V / 4 A. Start at the default ~35% brightness; do not begin
+physical bring-up with sustained full-white/full-brightness output.
 
 ## First physical bring-up
 
 After firmware has flashed successfully:
 
-1. Leave the controller powered down.
-2. Connect the HUB75 ribbon from the controller's boxed HUB75 connector to the
-   panel's **J1 / IN** connector.
-3. Connect the controller's VH-4P panel-power lead to the panel power input.
-   The physical panel PCB marks the rails `+5V` and `GND`; use the keyed cable
-   supplied for this hardware and do not reverse it.
-4. Apply the controller's 5 V USB-C power.
-5. Open the serial monitor.
-6. Run low-brightness diagnostics before relying on streamed artwork.
+1. power the controller down;
+2. connect the HUB75 ribbon from the controller to panel **J1 / IN**;
+3. connect the controller VH-4P lead to the panel power input;
+4. apply the controller's 5 V USB-C power;
+5. open the serial monitor;
+6. use low-brightness diagnostics before relying on streamed artwork.
 
-The expected boot configuration should include:
+Expected boot configuration:
 
 ```text
 driver=FM6124
@@ -230,15 +219,9 @@ A=8 B=18 C=10 D=9 E=16 CLK=12 LAT=11 OE=13
 initial brightness 90/255
 ```
 
-The firmware may join Wi-Fi immediately as well; panel diagnostics and network
-bring-up can be checked independently.
-
----
-
 ## Serial diagnostics
 
-When serial commands are enabled, commands are single keypresses; Enter is not
-required.
+Commands are single keypresses; Enter is not required.
 
 | Key | Action |
 |---|---|
@@ -256,22 +239,11 @@ required.
 
 Holding **BOOT** during a normal reset also requests diagnostic mode.
 
-### What the patterns tell us
-
-- `r/g/b`: verify logical colour channels and reveal swapped colour order.
-- `q`: reveal swapped halves, rotation or mirroring.
-- `c`: reveal address-line/scan problems through repeated or interleaved rows.
-- `w`: useful only at conservative brightness during early bring-up.
-- `m`: use only after low-brightness patterns are stable; establish the safe
-  practical brightness limit rather than assuming 255 is usable.
-
----
-
 ## Systematic panel diagnosis
 
 | Symptom | First checks / change |
 |---|---|
-| completely black | power path, J1/IN, ribbon seating, OE; re-read driver marking before changing driver |
+| completely black | power path, J1/IN, ribbon seating, OE |
 | doubled/interleaved vertically | E line and 1/32 scan wiring |
 | repeated horizontal bands | A-E mapping / scan wiring |
 | wrong colours | R/G/B mapping or panel colour order |
@@ -280,18 +252,12 @@ Holding **BOOT** during a normal reset also requests diagnostic mode.
 | ghosting | raise `kLatchBlanking` from 1 to 2 |
 | reset during bright white | power delivery / brightness limit until proven otherwise |
 
-The physical panel is marked FM6124EJ, so **FM6124 is now the primary driver**,
-not a fallback. Do not cycle through other shift drivers unless the physical
-behaviour gives a reason to question the observed marking or library support.
-
-All hardware constants live in [`main/board_config.h`](main/board_config.h).
-
----
+The physical panel is marked FM6124EJ, so FM6124 is the primary driver. All
+hardware constants live in [`main/board_config.h`](main/board_config.h).
 
 ## Network bring-up
 
-Once diagnostics render correctly, press `x` to resume normal rendering and
-verify the serial log reports, in order:
+Once diagnostics render correctly, press `x` and verify the serial log reports:
 
 - Wi-Fi IP acquired
 - WebSocket connected
@@ -300,56 +266,42 @@ verify the serial log reports, in order:
 - session established
 - frame counters increasing
 
-The add-on endpoint is:
+The endpoint is:
 
 ```text
 ws://<HOME_ASSISTANT_LAN_IP>:7887/matrix-studio
 ```
 
-In Home Assistant, the connected device count should move from zero to one.
-Then confirm real Matrix Studio scenes have the correct orientation and colour
-order.
-
----
+Home Assistant's device count should move from zero to one.
 
 ## Sustained Wi-Fi / DMA acceptance test
 
-A panel that displays one frame is **not** considered proven.
+A panel that displays one frame is not considered proven.
 
-After normal streaming works:
+1. run real scenes at 24 FPS for at least **15-30 minutes**;
+2. periodically press `i` and record reconnects, rejected frames, received /
+   rendered frames and dropped frames;
+3. watch for sparkles, tearing, freezes, colour corruption or resets;
+4. check Home Assistant/add-on logs;
+5. cautiously exercise brightness and establish a practical upper limit.
 
-1. run real scenes at the configured 24 FPS for at least **15-30 minutes**
-2. periodically press `i` and record:
-   - reconnect count
-   - rejected frames
-   - received/rendered frames
-   - dropped frames
-3. watch for sparkles, tearing, freezes, colour corruption or resets
-4. check Home Assistant/add-on logs for new errors
-5. cautiously exercise the brightness ramp and establish a practical upper
-   limit for the chosen power source
+After streaming stability is established, perform one OTA update as a separate
+acceptance test and verify that the device reconnects with the new
+`HELLO.fw_version` and that rollback remains available.
 
-Physical bring-up is complete only when diagnostics are correct **and** serial
-counters plus Home Assistant connection state confirm sustained operation.
-
-Record the final findings in [`docs/hardware.md`](../docs/hardware.md).
-
----
+Record final findings in [`docs/hardware.md`](../docs/hardware.md).
 
 ## What the firmware does
 
 - connects to Wi-Fi as a station and reconnects indefinitely
 - connects to the Matrix Studio WebSocket server
-- performs the frozen Protocol v1 handshake
-- validates inbound messages
-- responds to heartbeat traffic
+- performs Protocol v1 handshake and validation
 - renders RGB565 frames through a latest-wins queue
 - uses double-buffered HUB75 output
-- keeps display rendering and network work separated across the ESP32-S3 cores
+- separates display rendering and network work across ESP32-S3 cores
 - detects PSRAM at runtime rather than assuming it
-- exposes frame/reconnect/status counters for physical validation
-
----
+- exposes frame/reconnect/status counters
+- accepts rollback-safe firmware updates over the existing Wi-Fi/WebSocket path
 
 ## Host tests
 
@@ -362,8 +314,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The real firmware build remains the authoritative compile check for the
-ESP32-S3/HUB75 component combination:
+The real firmware build remains the authoritative compile check:
 
 ```sh
 . ~/esp/esp-idf/export.sh
@@ -371,26 +322,23 @@ cd esp32
 idf.py build
 ```
 
----
-
 ## Source layout
 
 ```text
 esp32/
 ├── CMakeLists.txt
 ├── sdkconfig.defaults
+├── partitions.csv             factory + dual OTA slots
 ├── main/
-│   ├── board_config.h          all panel GPIO/geometry/scan/driver settings
-│   ├── board_config.cpp
+│   ├── board_config.h         panel GPIO/geometry/scan/driver settings
+│   ├── ota_updater.*          ESP-IDF OTA write + rollback validation
 │   ├── app_config.h
 │   ├── wifi_secrets.h.example
-│   ├── display/                HUB75 driver, queue, render task, diagnostics
-│   ├── net/                    Wi-Fi + WebSocket client
-│   └── protocol/               Protocol v1 parser/encoder
-└── tests/                      host-side firmware protocol tests
+│   ├── display/               HUB75 driver, queue, render task, diagnostics
+│   ├── net/                   Wi-Fi + WebSocket client
+│   └── protocol/              Protocol v1 parser/encoder
+└── tests/                     host-side firmware protocol tests
 ```
-
----
 
 ## Troubleshooting
 
@@ -416,10 +364,16 @@ port 7887.
 
 **Panel diagnostics work but streaming does not**
 
-Treat that as a network/protocol problem; inspect `i`, the serial log, and the
-Home Assistant add-on logs rather than changing panel wiring.
+Treat that as a network/protocol problem; inspect `i`, serial logs, and the
+Home Assistant add-on logs before changing panel wiring.
 
 **Streaming works but the image is visibly wrong**
 
 Treat that as panel scan/colour/timing configuration; use `r/g/b/q/c` before
 changing network code.
+
+**An OTA image fails to boot**
+
+With rollback enabled, the bootloader should return to the previous valid image.
+USB flashing remains the recovery path if the device cannot reach Wi-Fi or both
+OTA slots are unusable.
