@@ -1,8 +1,8 @@
 // Matrix Studio Protocol v1 — canonical constants (C++ side).
 //
-// This header is the C++ half of the frozen contract described in
-// docs/protocol.md. protocol/matrix_studio_protocol.py is the Python half.
-// Do not change wire semantics here without updating docs/protocol.md first.
+// This header is the C++ half of the contract described in docs/protocol.md.
+// protocol/matrix_studio_protocol.py is the Python half. Do not change wire
+// semantics here without updating docs/protocol.md first.
 //
 // This header defines constants and POD-friendly struct layouts only; it
 // intentionally has no encode/decode logic so it can be included from either
@@ -41,6 +41,10 @@ constexpr size_t kBlankPayloadLen = 1;
 constexpr size_t kPingPayloadLen = 4;
 constexpr size_t kPongPayloadLen = 4;
 constexpr size_t kStatusFixedFieldsLen = 2;
+constexpr size_t kOtaBeginPayloadLen = 4;
+constexpr size_t kOtaDataFixedFieldsLen = 4;
+constexpr size_t kOtaMaxChunkBytes = 4096;
+constexpr size_t kOtaCommitPayloadLen = 0;
 
 enum class MessageType : uint8_t {
   kHello = 0x01,
@@ -51,6 +55,9 @@ enum class MessageType : uint8_t {
   kPing = 0x06,
   kPong = 0x07,
   kStatus = 0x08,
+  kOtaBegin = 0x09,
+  kOtaData = 0x0A,
+  kOtaCommit = 0x0B,
 };
 
 enum class PixelFormat : uint8_t {
@@ -64,6 +71,8 @@ enum class StatusCode : uint16_t {
   kErrMalformedPayload = 0x0003,
   kErrDimensionMismatch = 0x0004,
   kErrInternal = 0x0005,
+  kErrOtaState = 0x0006,
+  kErrOtaImage = 0x0007,
 };
 
 #pragma pack(push, 1)
@@ -126,8 +135,19 @@ struct WireStatusFixed {
   // followed by a UTF-8 message of (header.length - 2) bytes
 };
 
+struct WireOtaBegin {
+  uint32_t image_size;
+};
+
+struct WireOtaDataFixed {
+  uint32_t offset;
+  // followed by 1..kOtaMaxChunkBytes firmware bytes
+};
+
 #pragma pack(pop)
 
 static_assert(sizeof(WireHeader) == kHeaderSizeBytes, "WireHeader must be exactly 8 bytes on the wire");
+static_assert(sizeof(WireOtaBegin) == kOtaBeginPayloadLen, "WireOtaBegin must be exactly 4 bytes");
+static_assert(sizeof(WireOtaDataFixed) == kOtaDataFixedFieldsLen, "WireOtaDataFixed must be exactly 4 bytes");
 
 }  // namespace matrix_studio_protocol
