@@ -9,10 +9,20 @@ home-assistant/config.local.yaml
 home-assistant/secrets.yaml
 *.local.yaml
 
-# ESP32 / PlatformIO
-esp32/.pio/
+# ESP32 firmware (ESP-IDF)
+# Real credentials live in main/wifi_secrets.h; only the .example is committed.
+esp32/main/wifi_secrets.h
 esp32/secrets.h
 esp32/wifi_secrets.h
+# sdkconfig is generated from the committed sdkconfig.defaults and can contain
+# Wi-Fi credentials if configured via menuconfig, so it is not tracked.
+esp32/sdkconfig
+esp32/sdkconfig.old
+esp32/build/
+esp32/managed_components/
+esp32/dependencies.lock
+# Host-side protocol test build output
+esp32/tests/build/
 
 # Editors / OS
 .DS_Store

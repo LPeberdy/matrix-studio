@@ -1,0 +1,129 @@
+menu "Matrix Studio"
+
+    comment "Panel pins, scan pattern and driver chip live in main/board_config.h, not here"
+
+    menu "Wi-Fi"
+
+        config MATRIX_STUDIO_WIFI_SSID
+            string "Wi-Fi SSID"
+            default ""
+            help
+                Wi-Fi network the panel joins at boot.
+
+                Leave this empty and instead copy main/wifi_secrets.h.example to
+                main/wifi_secrets.h if you would rather not have credentials in
+                sdkconfig. wifi_secrets.h is gitignored; sdkconfig is not.
+
+        config MATRIX_STUDIO_WIFI_PASSWORD
+            string "Wi-Fi password"
+            default ""
+            help
+                WPA2 passphrase. Leave empty for an open network.
+
+                Do not commit a real value. See main/wifi_secrets.h.example.
+
+        config MATRIX_STUDIO_WIFI_MAX_RETRY_LOG
+            int "Log a warning after this many consecutive Wi-Fi retries"
+            default 10
+            range 1 1000
+            help
+                Purely cosmetic: the station retries forever regardless, this
+                only throttles how often it complains in the serial log.
+
+    endmenu
+
+    menu "Home Assistant server"
+
+        config MATRIX_STUDIO_SERVER_HOST
+            string "Home Assistant host"
+            default "homeassistant.local"
+            help
+                Hostname or IP address of the machine running the Matrix Studio
+                add-on. An IP address avoids depending on mDNS resolution.
+
+        config MATRIX_STUDIO_SERVER_PORT
+            int "WebSocket port"
+            default 7887
+            range 1 65535
+            help
+                Protocol v1 default is 7887 (docs/protocol.md §6).
+
+        config MATRIX_STUDIO_SERVER_PATH
+            string "WebSocket path"
+            default "/matrix-studio"
+            help
+                Protocol v1 default is /matrix-studio (docs/protocol.md §6).
+
+        config MATRIX_STUDIO_FRAME_TIMEOUT_MS
+            int "No-signal fallback after this many ms without a FRAME"
+            default 5000
+            range 250 600000
+            help
+                docs/protocol.md §3.2. After this long with no FRAME the panel
+                shows a quiet idle indicator instead of stale pixels. The
+                WebSocket connection is deliberately NOT dropped: an idle scene
+                is a normal, healthy state.
+
+    endmenu
+
+    menu "Display behaviour"
+
+        config MATRIX_STUDIO_SHOW_CONNECTION_PIXEL
+            bool "Tint the top-left pixel with the connection state"
+            default y
+            help
+                Overwrites pixel (0,0) of every displayed frame with a colour
+                indicating Wi-Fi/WebSocket state:
+
+                  red     = Wi-Fi down
+                  amber   = Wi-Fi up, WebSocket down
+                  blue    = WebSocket open, waiting for HELLO_ACK
+                  green   = connected and handshaked
+                  (no tint once frames are streaming normally)
+
+                Costs exactly one pixel of artwork. Turn off if you would
+                rather have the full 64x64 image.
+
+        config MATRIX_STUDIO_BOOT_INTO_DIAGNOSTICS
+            bool "Boot straight into diagnostic mode"
+            default n
+            help
+                Skips Wi-Fi entirely and cycles the bring-up test patterns
+                forever. Equivalent to holding the BOOT button at power-on.
+                Useful when you have no network yet and just want to prove the
+                pin mapping in main/board_config.h is right.
+
+        config MATRIX_STUDIO_SERIAL_COMMANDS
+            bool "Accept single-key commands on the serial console"
+            default y
+            help
+                Lets you trigger diagnostic patterns at runtime over the same
+                serial port `idf.py monitor` is already using. Press '?' for
+                the key list.
+
+    endmenu
+
+    menu "Tasks"
+
+        config MATRIX_STUDIO_RENDER_CORE
+            int "CPU core for the render/panel task"
+            default 1
+            range 0 1
+            help
+                Keep this on a different core from the network task. This is
+                the documented mitigation for the Wi-Fi/DMA interference risk
+                on ESP32-S3 HUB75 boards (docs/hardware.md, docs/protocol.md
+                §7), not merely tidy practice.
+
+        config MATRIX_STUDIO_NETWORK_CORE
+            int "CPU core for the Protocol v1 client task"
+            default 0
+            range 0 1
+            help
+                Core 0 is where the Wi-Fi and lwIP tasks live by default, so
+                keeping the protocol client alongside them and the panel work
+                on core 1 keeps frame decoding off the radio's core.
+
+    endmenu
+
+endmenu

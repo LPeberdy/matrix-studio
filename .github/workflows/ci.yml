@@ -42,8 +42,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # v5.5, not v5.3: esp-hub75 0.3.6's ESP32-S3 GDMA backend uses
+      # gdma_channel_alloc_config_t::isr_cache_safe and
+      # gdma_strategy_config_t::eof_till_data_popped, which were added in
+      # ESP-IDF v5.4. See esp32/README.md "Why ESP-IDF v5.5 and not v5.3".
       - uses: espressif/esp-idf-ci-action@v1
         with:
-          esp_idf_version: v5.3
+          esp_idf_version: v5.5
           target: esp32s3
           path: esp32
