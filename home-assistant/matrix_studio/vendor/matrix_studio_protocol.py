@@ -4,16 +4,12 @@ This module is the reference implementation of docs/protocol.md. It is used
 by the Home Assistant side and by protocol/fixtures/generate_fixtures.py to
 produce the golden test vectors that both sides must validate against.
 
-Do not change wire semantics here without updating docs/protocol.md first —
-see that document's header for the change process. This file is the
-executable half of the frozen contract; esp32/lib/matrix_studio_protocol.h is
-the C++ half.
+Do not change wire semantics here without updating docs/protocol.md first.
 """
-
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 
 PROTOCOL_VERSION = 1
@@ -32,6 +28,7 @@ DEFAULT_WS_PATH = "/matrix-studio"
 
 DEVICE_ID_FIELD_LEN = 16
 FW_VERSION_FIELD_LEN = 16
+OTA_MAX_CHUNK_BYTES = 4096
 
 
 class MessageType(IntEnum):
@@ -43,6 +40,9 @@ class MessageType(IntEnum):
     PING = 0x06
     PONG = 0x07
     STATUS = 0x08
+    OTA_BEGIN = 0x09
+    OTA_DATA = 0x0A
+    OTA_COMMIT = 0x0B
 
 
 class PixelFormat(IntEnum):
@@ -56,6 +56,8 @@ class StatusCode(IntEnum):
     ERR_MALFORMED_PAYLOAD = 0x0003
     ERR_DIMENSION_MISMATCH = 0x0004
     ERR_INTERNAL = 0x0005
+    ERR_OTA_STATE = 0x0006
+    ERR_OTA_IMAGE = 0x0007
 
 
 class ProtocolError(ValueError):
@@ -151,7 +153,7 @@ class Frame:
     width: int
     height: int
     pixel_format: int
-    pixels: bytes  # width*height*2 bytes, RGB565 LE, row-major
+    pixels: bytes
 
     def encode(self) -> bytes:
         expected = self.width * self.height * 2
@@ -257,6 +259,61 @@ class Status:
         code = struct.unpack("<H", payload[:2])[0]
         message = payload[2:].decode("utf-8", errors="replace")
         return Status(code, message)
+
+
+@dataclass
+class OtaBegin:
+    image_size: int
+
+    def encode(self) -> bytes:
+        if self.image_size <= 0 or self.image_size > 0xFFFFFFFF:
+            raise ValueError("image_size must fit u32 and be greater than zero")
+        payload = struct.pack("<I", self.image_size)
+        return encode_header(MessageType.OTA_BEGIN, len(payload)) + payload
+
+    @staticmethod
+    def decode_payload(payload: bytes) -> "OtaBegin":
+        if len(payload) != 4:
+            raise ProtocolError(f"OTA_BEGIN payload must be 4 bytes, got {len(payload)}")
+        image_size = struct.unpack("<I", payload)[0]
+        if image_size == 0:
+            raise ProtocolError("OTA_BEGIN image_size must be greater than zero")
+        return OtaBegin(image_size)
+
+
+@dataclass
+class OtaData:
+    offset: int
+    data: bytes
+
+    def encode(self) -> bytes:
+        if self.offset < 0 or self.offset > 0xFFFFFFFF:
+            raise ValueError("offset must fit u32")
+        if not self.data or len(self.data) > OTA_MAX_CHUNK_BYTES:
+            raise ValueError(f"data must contain 1..{OTA_MAX_CHUNK_BYTES} bytes")
+        payload = struct.pack("<I", self.offset) + bytes(self.data)
+        return encode_header(MessageType.OTA_DATA, len(payload)) + payload
+
+    @staticmethod
+    def decode_payload(payload: bytes) -> "OtaData":
+        if len(payload) < 5 or len(payload) > 4 + OTA_MAX_CHUNK_BYTES:
+            raise ProtocolError(
+                f"OTA_DATA payload must contain 4-byte offset plus 1..{OTA_MAX_CHUNK_BYTES} data bytes"
+            )
+        offset = struct.unpack("<I", payload[:4])[0]
+        return OtaData(offset, payload[4:])
+
+
+@dataclass
+class OtaCommit:
+    def encode(self) -> bytes:
+        return encode_header(MessageType.OTA_COMMIT, 0)
+
+    @staticmethod
+    def decode_payload(payload: bytes) -> "OtaCommit":
+        if payload:
+            raise ProtocolError(f"OTA_COMMIT payload must be empty, got {len(payload)} bytes")
+        return OtaCommit()
 
 
 def rgb888_to_rgb565(r: int, g: int, b: int) -> int:
