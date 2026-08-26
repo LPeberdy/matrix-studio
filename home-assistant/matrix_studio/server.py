@@ -37,12 +37,18 @@ _LOGGER = logging.getLogger(__name__)
 HELLO_TIMEOUT_S = protocol.HELLO_TIMEOUT_MS / 1000.0
 PING_INTERVAL_S = protocol.PING_INTERVAL_MS / 1000.0
 PONG_TIMEOUT_S = protocol.PONG_TIMEOUT_MS / 1000.0
+OTA_STATUS_TIMEOUT_S = 5.0
+MAX_OTA_IMAGE_BYTES = 3 * 1024 * 1024
 
 #: WebSocket close codes we use (RFC 6455).
 _CLOSE_PROTOCOL_ERROR = 1002
 _CLOSE_GOING_AWAY = 1001
 
 _EXTENSION_TYPE_RANGE = range(0x80, 0xFF)
+
+
+class OtaUpdateError(RuntimeError):
+    """Raised when a device refuses or fails a firmware update."""
 
 
 @dataclass
@@ -66,6 +72,13 @@ class DeviceConnection:
     sent_blank: bool | None = None
     pending_ping: int | None = None
     pending_ping_at: float = 0.0
+    ota_active: bool = False
+    ota_bytes_sent: int = 0
+    ota_total_bytes: int = 0
+    ota_last_error: str = ""
+    ota_image: bytes | None = field(default=None, repr=False)
+    ota_done: asyncio.Future[None] | None = field(default=None, repr=False)
+    ota_status: asyncio.Queue[protocol.Status] = field(default_factory=asyncio.Queue, repr=False)
 
     def as_dict(self) -> dict[str, Any]:
         now = time.time()
@@ -81,6 +94,12 @@ class DeviceConnection:
             "sequence": self.sequence,
             "last_frame_age": round(now - self.last_frame_at, 2) if self.last_frame_at else None,
             "rtt_ms": round(self.last_rtt_ms, 1) if self.last_rtt_ms is not None else None,
+            "ota": {
+                "active": self.ota_active,
+                "bytes_sent": self.ota_bytes_sent,
+                "total_bytes": self.ota_total_bytes,
+                "last_error": self.ota_last_error,
+            },
         }
 
 
@@ -135,6 +154,47 @@ class DeviceServer:
     def notify_controls_changed(self) -> None:
         """Push brightness/blank to every device promptly, even while idle."""
         self.bus.wake_all()
+
+    async def ota_update(self, connection_id: int, image: bytes) -> None:
+        """Install one ESP-IDF application image over the existing device session.
+
+        The writer task owns all OTA traffic, so FRAME streaming pauses cleanly
+        for the update and resumes only if the update fails. Every chunk waits
+        for the firmware's STATUS acknowledgement before the next is sent.
+        """
+        connection = self._connections.get(connection_id)
+        if connection is None:
+            raise OtaUpdateError(f"device connection {connection_id} is not connected")
+        if connection.ota_active or connection.ota_image is not None:
+            raise OtaUpdateError("an OTA update is already in progress for this device")
+
+        image = bytes(image)
+        if not image:
+            raise OtaUpdateError("firmware image is empty")
+        if len(image) > MAX_OTA_IMAGE_BYTES:
+            raise OtaUpdateError(
+                f"firmware image is {len(image)} bytes; OTA app partition is {MAX_OTA_IMAGE_BYTES} bytes"
+            )
+        # ESP-IDF application images begin with the standard ESP image magic.
+        # esp_ota_end() performs the authoritative validation on-device; this is
+        # just an early guard against uploading an obviously wrong file.
+        if image[0] != 0xE9:
+            raise OtaUpdateError("file is not an ESP-IDF application image (missing 0xE9 image magic)")
+
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future[None] = loop.create_future()
+        connection.ota_image = image
+        connection.ota_done = done
+        connection.ota_bytes_sent = 0
+        connection.ota_total_bytes = len(image)
+        connection.ota_last_error = ""
+        self.bus.wake_all()
+
+        try:
+            await done
+        finally:
+            if connection.ota_done is done:
+                connection.ota_done = None
 
     # --------------------------------------------------------------- lifecycle
 
@@ -195,6 +255,10 @@ class DeviceServer:
                 await self._send(ws, protocol.Status(protocol.StatusCode.ERR_INTERNAL, "server error").encode())
         finally:
             self._connections.pop(connection.id, None)
+            if connection.ota_done is not None and not connection.ota_done.done():
+                connection.ota_done.set_exception(OtaUpdateError("device disconnected during OTA update"))
+            connection.ota_active = False
+            connection.ota_image = None
             with contextlib.suppress(Exception):
                 await ws.close()
             _LOGGER.info(
@@ -429,10 +493,12 @@ class DeviceServer:
             status = protocol.Status.decode_payload(payload)
             level = logging.INFO if status.code == protocol.StatusCode.OK else logging.WARNING
             _LOGGER.log(level, "connection %d STATUS %#06x: %s", connection.id, status.code, status.message)
+            if connection.ota_active:
+                connection.ota_status.put_nowait(status)
         elif message_type is protocol.MessageType.HELLO:
             _LOGGER.warning("connection %d sent a second HELLO; ignoring (each connection is one session)", connection.id)
         else:
-            # HELLO_ACK / FRAME / BRIGHTNESS / BLANK are server -> device only.
+            # HELLO_ACK / FRAME / BRIGHTNESS / BLANK / OTA_* are server -> device only.
             _LOGGER.warning(
                 "connection %d sent %s, which is server->device only; ignoring", connection.id, message_type.name
             )
@@ -445,17 +511,38 @@ class DeviceServer:
             # Bring the freshly connected device in line with current controls.
             await self._flush_controls(ws, connection)
             while not ws.closed:
+                if connection.ota_image is not None:
+                    await self._perform_ota(ws, connection)
+                    continue
+                if connection.ota_active:
+                    # OTA_COMMIT has been acknowledged and the device is about
+                    # to reboot. Do not race its outbound STATUS with frames.
+                    await asyncio.sleep(0.05)
+                    continue
+
                 try:
                     frame = await asyncio.wait_for(subscription.get(), timeout=self.ping_interval)
                 except (asyncio.TimeoutError, TimeoutError):
                     frame = None
-                    if not await self._heartbeat(ws, connection):
-                        return
+
                 if ws.closed:
                     return
+                if connection.ota_image is not None:
+                    await self._perform_ota(ws, connection)
+                    continue
+                if connection.ota_active:
+                    continue
+
+                # A bare FrameBus wake is how control changes reach an idle
+                # device. Flush controls before deciding whether this wake also
+                # needs a heartbeat; otherwise a control-only wake can starve
+                # behind PING/PONG handling.
                 await self._flush_controls(ws, connection)
                 if frame is None:
+                    if not await self._heartbeat(ws, connection):
+                        return
                     continue
+
                 if self.controls.blank:
                     continue
                 message = protocol.Frame(
@@ -471,6 +558,71 @@ class DeviceServer:
                 connection.frames_sent += 1
                 connection.frames_dropped = subscription.dropped
                 connection.last_frame_at = time.time()
+
+    async def _perform_ota(self, ws: web.WebSocketResponse, connection: DeviceConnection) -> None:
+        image = connection.ota_image
+        if image is None:
+            return
+
+        connection.ota_active = True
+        # No STATUS from before the OTA transaction may satisfy an OTA ack.
+        while not connection.ota_status.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                connection.ota_status.get_nowait()
+
+        began = False
+        try:
+            _LOGGER.info(
+                "starting OTA for %s: %d bytes", connection.device_id or connection.remote, len(image)
+            )
+            await self._send(ws, protocol.OtaBegin(len(image)).encode())
+            await self._expect_ota_status(connection, "OTA_BEGIN")
+            began = True
+
+            for offset in range(0, len(image), protocol.OTA_MAX_CHUNK_BYTES):
+                chunk = image[offset : offset + protocol.OTA_MAX_CHUNK_BYTES]
+                await self._send(ws, protocol.OtaData(offset, chunk).encode())
+                await self._expect_ota_status(connection, "OTA_DATA")
+                connection.ota_bytes_sent = offset + len(chunk)
+
+            await self._send(ws, protocol.OtaCommit().encode())
+            await self._expect_ota_status(connection, "ota committed; rebooting")
+            connection.ota_bytes_sent = len(image)
+            connection.ota_image = None
+            _LOGGER.info("OTA committed for %s; waiting for device reboot", connection.device_id or connection.remote)
+            if connection.ota_done is not None and not connection.ota_done.done():
+                connection.ota_done.set_result(None)
+            # Keep ota_active true until the expected reboot disconnects this
+            # session. The writer therefore sends no more frames on the old boot.
+        except OtaUpdateError as exc:
+            connection.ota_last_error = str(exc)
+            connection.ota_image = None
+            connection.ota_active = False
+            _LOGGER.warning("OTA failed for %s: %s", connection.device_id or connection.remote, exc)
+            if connection.ota_done is not None and not connection.ota_done.done():
+                connection.ota_done.set_exception(exc)
+            if began and not ws.closed:
+                # Protocol v1 has no OTA_ABORT message. Closing the session is
+                # intentional: the firmware's connection teardown calls
+                # esp_ota_abort(), then reconnects with a clean OTA state.
+                await ws.close(code=_CLOSE_GOING_AWAY, message=b"ota transfer failed")
+            else:
+                self.bus.wake_all()
+
+    async def _expect_ota_status(self, connection: DeviceConnection, expected_message: str) -> protocol.Status:
+        try:
+            status = await asyncio.wait_for(connection.ota_status.get(), timeout=OTA_STATUS_TIMEOUT_S)
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            raise OtaUpdateError(f"timed out waiting for {expected_message} acknowledgement") from exc
+
+        if status.code != protocol.StatusCode.OK:
+            message = status.message or "device rejected the update"
+            raise OtaUpdateError(f"{expected_message} failed with status {status.code:#06x}: {message}")
+        if status.message != expected_message:
+            raise OtaUpdateError(
+                f"expected {expected_message!r} acknowledgement, received {status.message!r}"
+            )
+        return status
 
     async def _flush_controls(self, ws: web.WebSocketResponse, connection: DeviceConnection) -> None:
         brightness = self.controls.clamped_brightness()

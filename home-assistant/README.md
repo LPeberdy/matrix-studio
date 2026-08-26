@@ -25,11 +25,11 @@ options ──▶ SceneEngine ──▶ FrameBus ──▶ DeviceServer :7887  �
 | `Dockerfile` / `run.sh` | Image build and entrypoint |
 | `matrix_studio/app.py` | Composition root; wires everything together |
 | `matrix_studio/engine.py` | Fixed-cadence render loop + broken-scene fallback |
-| `matrix_studio/server.py` | Protocol v1 WebSocket server |
+| `matrix_studio/server.py` | Protocol v1 WebSocket server, including OTA sender |
 | `matrix_studio/ha_state.py` | Home Assistant state adapter (Supervisor proxy) |
 | `matrix_studio/loader.py` | Scene discovery, loading, hot reload |
 | `matrix_studio/framebuffer.py` | RGB565 conversion + latest-frame fan-out |
-| `matrix_studio/web.py` + `static/` | Ingress UI and preview endpoints |
+| `matrix_studio/web.py` + `static/` | Ingress UI, preview and firmware upload endpoints |
 | `matrix_studio/preview.py` | Emulator / preview CLI (no hardware needed) |
 | `matrix_studio/scenes/` | Built-in scenes |
 | `matrix_studio/vendor/` | Verbatim copy of the frozen protocol codec |
@@ -80,7 +80,7 @@ locally because `config.yaml` declares no prebuilt `image:`.
 |---|---|---|
 | `active_scene` | `plasma` | Scene to start on; also settable from the UI |
 | `target_fps` | `24` | 1-60. ~24 uses ≈7 ms/frame on a Pi 5 |
-| `brightness` | `160` | 0-255, sent to the device as `BRIGHTNESS` |
+| `brightness` | `90` | 0-255, sent to the device as `BRIGHTNESS`; ~35% is the conservative bring-up default |
 | `blank` | `false` | Start with the panel blanked |
 | `scenes_dir` | `/config/scenes` | Inside the container. On the host this is `/addon_configs/<slug>_matrix_studio/scenes` |
 | `ws_port` | `7887` | Container-internal listen port — see the caveat below |
@@ -107,9 +107,31 @@ you configure (plus auto-discovered lights, if enabled).
 ### Point the device at it
 
 The ESP32 connects out to
-`ws://<home-assistant-host>:7887/matrix-studio`. The add-on never connects to
-the device, so no inbound rule on the ESP32 side is needed. Zero connected
-devices is a normal, healthy state — the add-on keeps rendering regardless.
+`ws://<home-assistant-host>:7887/matrix-studio`. The add-on never opens a
+separate management connection to the device: display traffic and firmware
+updates both use the device's existing Protocol v1 WebSocket session. Zero
+connected devices is a normal, healthy state — the add-on keeps rendering
+regardless.
+
+### Firmware updates
+
+Once the ESP32 has received the first wired OTA-capable image, later application
+firmware can be installed from the Matrix Studio ingress UI:
+
+1. build the firmware from `esp32/` with `idf.py build`;
+2. open Matrix Studio in Home Assistant and find **Firmware**;
+3. select the connected device and choose `esp32/build/matrix_studio.bin`;
+4. press **Install firmware**.
+
+The server pauses FRAME traffic, sends `OTA_BEGIN`, sequential 4096-byte
+`OTA_DATA` chunks with a STATUS acknowledgement after every chunk, then
+`OTA_COMMIT`. The device validates the image, selects the inactive OTA slot and
+reboots. The UI reports transfer progress from the live device session; after
+reboot the Devices table should show the new `HELLO.fw_version`.
+
+The upload endpoint accepts only an ESP-IDF application image up to the 3 MiB
+OTA-slot size. Bootloader and partition-table changes remain recovery/USB work,
+not routine OTA updates.
 
 ## Writing scenes
 

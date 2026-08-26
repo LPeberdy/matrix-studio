@@ -67,13 +67,11 @@ extern "C" void app_main(void) {
 
   matrix_studio::psram::probe_and_log();
 
-  if (g_display.begin() != ESP_OK) {
+  const bool display_ok = g_display.begin() == ESP_OK;
+  if (!display_ok) {
     ESP_LOGE(TAG, "the panel failed to start. The firmware keeps running so the serial log stays "
-                  "usable, but nothing will be displayed. Check main/board_config.h and the "
-                  "wiring table in docs/hardware.md.");
-    // On a factory/USB boot this is non-fatal so diagnostics remain available.
-    // On a just-installed OTA image it is a failed validation and rolls back.
-    matrix_studio::ota::finish_boot_validation(false);
+                  "usable on a factory/USB boot, but a just-installed OTA image will not be "
+                  "accepted. Check main/board_config.h and docs/hardware.md.");
   }
 
   ESP_ERROR_CHECK(g_frames.init(matrix_studio::board::kFrameBytes));
@@ -123,11 +121,10 @@ extern "C" void app_main(void) {
     return;
   }
 
-  // Reaching this point proves that the new image can initialize the panel,
-  // render plumbing, console, Wi-Fi subsystem and protocol task. Network
-  // association itself may legitimately fail because of local configuration,
-  // so it is not part of rollback validation.
-  matrix_studio::ota::finish_boot_validation(true);
+  // An OTA image is accepted only if every core local subsystem initialized,
+  // including HUB75. Network association itself may legitimately fail because
+  // of local configuration, so it is not part of rollback validation.
+  matrix_studio::ota::finish_boot_validation(display_ok);
 
   ESP_LOGI(TAG, "startup complete; render core %d, network core %d", matrix_studio::config::kRenderCore,
            matrix_studio::config::kNetworkCore);

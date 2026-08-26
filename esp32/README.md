@@ -65,6 +65,11 @@ constexpr uint8_t kLatchBlanking = 1;
 constexpr uint8_t kDefaultBrightness = 90;  // ~35%
 ```
 
+The project pins `esp-hub75` to the upstream commit that routes FM6124 through
+the library's FM6126A REG1/REG2 initialization sequence. This avoids the older
+registry release's `ESP_ERR_NOT_SUPPORTED` path for FM6124 while keeping the
+fix upstream rather than carrying a local driver fork.
+
 The scan wiring, colour order, clock speed and latch blanking still require
 physical confirmation.
 
@@ -179,6 +184,26 @@ OTA uses ordinary Protocol v1 messages on the same WebSocket connection:
 `OTA_BEGIN`, sequential `OTA_DATA` chunks, then `OTA_COMMIT`. See
 [`docs/protocol.md`](../docs/protocol.md) for the exact contract.
 
+### Routine OTA update
+
+Build a new application image normally:
+
+```sh
+. ~/esp/esp-idf/export.sh
+cd matrix-studio/esp32
+idf.py build
+```
+
+Then open the Matrix Studio Home Assistant ingress UI. Under **Firmware**, pick
+the connected device, select `esp32/build/matrix_studio.bin`, and press
+**Install firmware**. The server pauses display frames during transfer, waits
+for a device STATUS acknowledgement after each chunk, commits the image and
+then lets the ESP32 reboot into the inactive OTA slot.
+
+The reconnected device should report the new firmware version in HELLO. OTA
+updates replace the application image; bootloader or partition-table changes
+remain USB/recovery operations.
+
 ## Normal deployed wiring and power
 
 ```text
@@ -204,7 +229,7 @@ physical bring-up with sustained full-white/full-brightness output.
 After firmware has flashed successfully:
 
 1. power the controller down;
-2. connect the HUB75 ribbon from the controller to panel **J1 / IN**;
+2. connect the HUB75 ribbon from either controller HUB75 connector to panel **J1 / IN**;
 3. connect the controller VH-4P lead to the panel power input;
 4. apply the controller's 5 V USB-C power;
 5. open the serial monitor;
@@ -359,21 +384,5 @@ Create and fill in `main/wifi_secrets.h` from the example file.
 
 **WebSocket repeatedly times out or refuses the connection**
 
-Use the Home Assistant Pi's numeric LAN IP and confirm the add-on is running on
-port 7887.
-
-**Panel diagnostics work but streaming does not**
-
-Treat that as a network/protocol problem; inspect `i`, serial logs, and the
-Home Assistant add-on logs before changing panel wiring.
-
-**Streaming works but the image is visibly wrong**
-
-Treat that as panel scan/colour/timing configuration; use `r/g/b/q/c` before
-changing network code.
-
-**An OTA image fails to boot**
-
-With rollback enabled, the bootloader should return to the previous valid image.
-USB flashing remains the recovery path if the device cannot reach Wi-Fi or both
-OTA slots are unusable.
+Check that the Home Assistant add-on is running, port 7887 is published, the
+firmware server host is the Pi's LAN IP, and both devices are on the same LAN.

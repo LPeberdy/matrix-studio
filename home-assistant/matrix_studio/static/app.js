@@ -7,7 +7,9 @@ const STATUS_INTERVAL_MS = 1000;
 
 const el = (id) => document.getElementById(id);
 let sceneOptionsKey = "";
+let otaDevicesKey = "";
 let brightnessPending = false;
+let otaRequestInFlight = false;
 
 async function post(path, body) {
   const response = await fetch(path, {
@@ -89,6 +91,44 @@ function renderDevices(status) {
     .join("");
 }
 
+function renderFirmware(status) {
+  const select = el("ota-device");
+  const previous = select.value;
+  const key = status.devices.map((device) => `${device.id}:${device.device_id}:${device.fw_version}`).join("|");
+  if (key !== otaDevicesKey) {
+    otaDevicesKey = key;
+    select.innerHTML = "";
+    for (const device of status.devices) {
+      const option = document.createElement("option");
+      option.value = String(device.id);
+      option.textContent = `${device.device_id || device.remote} · ${device.fw_version || "unknown firmware"}`;
+      select.appendChild(option);
+    }
+    if (status.devices.some((device) => String(device.id) === previous)) {
+      select.value = previous;
+    }
+  }
+
+  select.disabled = status.devices.length === 0 || otaRequestInFlight;
+  const selected = status.devices.find((device) => String(device.id) === select.value);
+  const button = el("ota-install");
+  button.disabled = status.devices.length === 0 || otaRequestInFlight || Boolean(selected?.ota?.active);
+
+  if (!selected) {
+    if (!otaRequestInFlight) el("ota-status").textContent = "No device connected.";
+    return;
+  }
+
+  if (selected.ota?.active) {
+    const sent = Number(selected.ota.bytes_sent || 0);
+    const total = Number(selected.ota.total_bytes || 0);
+    const percent = total ? Math.floor((sent * 100) / total) : 0;
+    el("ota-status").textContent = `Installing firmware… ${percent}% (${sent}/${total} bytes)`;
+  } else if (selected.ota?.last_error && !otaRequestInFlight) {
+    el("ota-status").textContent = `Last update failed: ${selected.ota.last_error}`;
+  }
+}
+
 function renderStatus(status) {
   el("uptime").textContent = `up ${Math.round(status.uptime_seconds)}s · protocol v${status.protocol_version}`;
   el("stat-devices").textContent = `${status.device_count} connected (${status.server.total_connections} total)`;
@@ -116,6 +156,7 @@ function renderStatus(status) {
   renderScenes(status);
   renderAlerts(status);
   renderDevices(status);
+  renderFirmware(status);
 }
 
 async function refreshStatus() {
@@ -148,6 +189,42 @@ el("reload").addEventListener("click", async () => {
   await post("api/reload", {});
   sceneOptionsKey = "";
   refreshStatus();
+});
+
+el("ota-install").addEventListener("click", async () => {
+  const connectionId = el("ota-device").value;
+  const file = el("ota-file").files[0];
+  if (!connectionId) {
+    el("ota-status").textContent = "Select a connected device.";
+    return;
+  }
+  if (!file) {
+    el("ota-status").textContent = "Choose matrix_studio.bin first.";
+    return;
+  }
+
+  otaRequestInFlight = true;
+  el("ota-install").disabled = true;
+  el("ota-device").disabled = true;
+  el("ota-status").textContent = `Starting update with ${file.name} (${file.size} bytes)…`;
+
+  try {
+    const response = await fetch(`api/ota?connection_id=${encodeURIComponent(connectionId)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: file,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(result.error || `request failed with HTTP ${response.status}`);
+    }
+    el("ota-status").textContent = result.message || "Firmware committed; device rebooting.";
+  } catch (error) {
+    el("ota-status").textContent = `Update failed: ${error.message || error}`;
+  } finally {
+    otaRequestInFlight = false;
+    refreshStatus();
+  }
 });
 
 refreshStatus();

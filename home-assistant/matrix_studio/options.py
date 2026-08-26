@@ -89,7 +89,7 @@ class Options:
 
     active_scene: str = "plasma"
     target_fps: int = 24
-    brightness: int = 160
+    brightness: int = 90
     blank: bool = False
     scenes_dir: str = "/config/matrix_studio/scenes"
     ws_port: int = protocol.DEFAULT_WS_PORT
@@ -132,7 +132,7 @@ class Options:
         return cls(
             active_scene=_as_str(raw.get("active_scene"), "plasma") or "plasma",
             target_fps=_as_int(raw.get("target_fps"), "target_fps", 24, 1, 60),
-            brightness=_as_int(raw.get("brightness"), "brightness", 160, 0, 255),
+            brightness=_as_int(raw.get("brightness"), "brightness", 90, 0, 255),
             blank=_as_bool(raw.get("blank"), False),
             scenes_dir=_as_str(raw.get("scenes_dir"), "/config/matrix_studio/scenes")
             or "/config/matrix_studio/scenes",
