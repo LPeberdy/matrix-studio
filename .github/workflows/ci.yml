@@ -52,16 +52,15 @@ jobs:
       - run: cd esp32/tests && ctest --test-dir build --output-on-failure
 
   esp32-firmware-build:
-    # Firmware targets ESP-IDF (not PlatformIO/Arduino) — see docs/hardware.md
-    # for why: the esp-hub75 component + direct Wi-Fi tuning knobs are used
-    # to mitigate a known Wi-Fi/DMA interference risk on ESP32-S3 HUB75 boards.
+    # Firmware targets ESP-IDF (not PlatformIO/Arduino); see docs/hardware.md
+    # for the hardware/driver rationale and physical Wi-Fi/DMA acceptance test.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       # v5.5, not v5.3: esp-hub75 0.3.6's ESP32-S3 GDMA backend uses
       # gdma_channel_alloc_config_t::isr_cache_safe and
       # gdma_strategy_config_t::eof_till_data_popped, which were added in
-      # ESP-IDF v5.4. See esp32/README.md "Why ESP-IDF v5.5 and not v5.3".
+      # ESP-IDF v5.4. ESP-IDF v5.5 is the repository's tested baseline.
       - uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v5.5
