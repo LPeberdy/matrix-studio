@@ -9,10 +9,12 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "ota_updater.h"
 #include "protocol/ms_protocol.h"
 #include "protocol/reconnect_backoff.h"
 #include "psram_info.h"
@@ -29,15 +31,9 @@ constexpr EventBits_t kBitSocketUp = BIT0;
 constexpr EventBits_t kBitSocketDown = BIT1;
 constexpr EventBits_t kBitHelloAcked = BIT2;
 
-// Smallest receive buffer that can hold one full frame for this panel.
 constexpr size_t kMinRxCapacity = msp::kHeaderSizeBytes + msp::kFrameFixedFieldsLen + board::kFrameBytes;
-// Largest message the protocol permits at all (docs/protocol.md §2).
 constexpr size_t kMaxRxCapacity = msp::kHeaderSizeBytes + msp::kMaxPayloadBytes;
-
-// How long to wait for the TCP+HTTP upgrade before giving up and backing off.
 constexpr uint32_t kSocketConnectTimeoutMs = 15000;
-// Service-loop tick. Fine enough to keep heartbeat and frame-timeout deadlines
-// accurate to well within their tolerances, coarse enough to be free.
 constexpr uint32_t kServiceTickMs = 100;
 
 struct TxMessage {
@@ -77,15 +73,7 @@ class Client {
   }
 
  private:
-  // -------------------------------------------------------------------------
-  // Setup
-  // -------------------------------------------------------------------------
-
   esp_err_t allocate_rx_buffer() {
-    // Opportunistic PSRAM (docs/hardware.md): with PSRAM we can afford a buffer
-    // big enough for any legal Protocol v1 message, so an oversized-but-legal
-    // message from a future server is reassembled rather than dropped. Without
-    // it, size for this panel's frame plus slack and say so in the log.
     if (psram::available()) {
       rx_capacity_ = kMaxRxCapacity;
       rx_ = static_cast<uint8_t*>(heap_caps_malloc(rx_capacity_, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -103,16 +91,11 @@ class Client {
       ESP_LOGE(TAG, "cannot allocate a %u-byte receive buffer", static_cast<unsigned>(rx_capacity_));
       return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "receive buffer: %u bytes in internal SRAM (messages larger than this are dropped)",
-             static_cast<unsigned>(rx_capacity_));
+    ESP_LOGI(TAG, "receive buffer: %u bytes in internal SRAM", static_cast<unsigned>(rx_capacity_));
     return ESP_OK;
   }
 
   static void task_entry(void* arg) { static_cast<Client*>(arg)->run(); }
-
-  // -------------------------------------------------------------------------
-  // Connection lifecycle (docs/protocol.md §3.3)
-  // -------------------------------------------------------------------------
 
   [[noreturn]] void run() {
     char uri[160];
@@ -122,23 +105,18 @@ class Client {
     ESP_LOGI(TAG, "device_id=%s fw=%s panel=%ux%u RGB565", wifi::device_id(), config::kFirmwareVersion,
              board::kPanelWidth, board::kPanelHeight);
 
-    // Show the idle indicator straight away rather than leaving the panel dark
-    // while Wi-Fi associates - a dark panel reads as a dead board.
     post_no_signal();
 
     for (;;) {
       if (!wifi::is_connected()) {
         post_state(ConnectionState::kWifiDown);
         ESP_LOGI(TAG, "waiting for Wi-Fi before connecting");
-        // §3.3: re-establish Wi-Fi first, then apply backoff to the WebSocket.
         wifi::wait_connected(UINT32_MAX);
       }
       post_state(ConnectionState::kWifiUp);
 
       run_session(uri);
 
-      // Any session end - clean close, error, failed heartbeat or Wi-Fi loss -
-      // takes the same path. §3.4: a server restart is not a special case.
       post_no_signal();
       post_state(wifi::is_connected() ? ConnectionState::kWifiUp : ConnectionState::kWifiDown);
       ++reconnects_;
@@ -155,13 +133,8 @@ class Client {
     cfg.task_stack = 5120;
     cfg.task_prio = 5;
     cfg.buffer_size = 4096;
-    // §3.3 owns reconnection, with a specific backoff schedule. Letting the
-    // library reconnect underneath us would give a second, conflicting policy.
     cfg.disable_auto_reconnect = true;
     cfg.network_timeout_ms = 10000;
-    // The WebSocket-level ping is useful for NAT keepalive, but liveness is
-    // decided by the Protocol v1 heartbeat in §3.1, so the library must not
-    // drop the connection on its own timer.
     cfg.ping_interval_sec = 20;
     cfg.disable_pingpong_discon = true;
 
@@ -192,8 +165,6 @@ class Client {
 
     post_state(ConnectionState::kSocketOpen);
 
-    // §3.2: HELLO must be sent within HELLO_TIMEOUT_MS of the socket opening.
-    // Sending it immediately is the only sane reading of that.
     if (!send_hello()) {
       teardown();
       return;
@@ -208,8 +179,6 @@ class Client {
       return;
     }
 
-    // A handshake completed is what "the server is healthy" means, so this is
-    // the only place the backoff resets (§3.3).
     backoff_.reset();
     handshaked_ = true;
     post_state(ConnectionState::kHandshaked);
@@ -226,6 +195,13 @@ class Client {
     for (;;) {
       drain_tx_queue();
 
+      if (reboot_requested_) {
+        drain_tx_queue();
+        ESP_LOGI(TAG, "OTA complete; rebooting into new firmware");
+        vTaskDelay(pdMS_TO_TICKS(250));
+        esp_restart();
+      }
+
       const EventBits_t bits = xEventGroupGetBits(events_);
       if (bits & kBitSocketDown) {
         ESP_LOGW(TAG, "socket closed by peer or transport");
@@ -233,8 +209,6 @@ class Client {
       }
       if (close_requested_) {
         ESP_LOGW(TAG, "closing connection: %s", close_reason_);
-        // Give the outbound STATUS (if any) a moment to leave before the close,
-        // since §3.5 asks for STATUS *then* close.
         drain_tx_queue();
         esp_websocket_client_close(client_, pdMS_TO_TICKS(1000));
         return;
@@ -251,8 +225,6 @@ class Client {
     }
   }
 
-  // §3.1: answer every PING, and if our own PING goes unanswered for
-  // PONG_TIMEOUT_MS treat the connection as dead. Returns false when dead.
   bool check_heartbeat() {
     if (ping_outstanding_) {
       if (elapsed_ms(ping_sent_us_) > msp::kPongTimeoutMs) {
@@ -263,8 +235,6 @@ class Client {
       return true;
     }
 
-    // Anything received counts as evidence of liveness (§3.1: "an in-flight
-    // frame stream is itself evidence of liveness"), so only ping when idle.
     if (elapsed_ms(last_rx_us_) >= msp::kPingIntervalMs) {
       ping_nonce_ = esp_random();
       uint8_t buf[kMaxEncodedTxBytes];
@@ -278,9 +248,8 @@ class Client {
     return true;
   }
 
-  // §3.2: no FRAME for FRAME_TIMEOUT_MS means show a quiet fallback, but
-  // explicitly does NOT mean drop the connection.
   void check_frame_timeout() {
+    if (ota::active()) return;
     if (no_signal_) return;
     if (elapsed_ms(last_frame_us_) < config::kFrameTimeoutMs) return;
     no_signal_ = true;
@@ -291,6 +260,7 @@ class Client {
   }
 
   void teardown() {
+    if (ota::active()) ota::abort();
     socket_connected_ = false;
     handshaked_ = false;
     if (client_ != nullptr) {
@@ -298,13 +268,13 @@ class Client {
       esp_websocket_client_destroy(client_);
       client_ = nullptr;
     }
-    // Anything queued belonged to the session that just ended.
     xQueueReset(tx_queue_);
   }
 
   void reset_session_state() {
     close_requested_ = false;
     close_reason_ = "";
+    reboot_requested_ = false;
     handshaked_ = false;
     ping_outstanding_ = false;
     no_signal_ = false;
@@ -312,12 +282,6 @@ class Client {
     rx_overflow_ = false;
   }
 
-  // -------------------------------------------------------------------------
-  // Outbound
-  // -------------------------------------------------------------------------
-
-  // Every send happens on this task, never from the WebSocket event handler:
-  // sending from inside a handler re-enters the client's own lock.
   bool enqueue_tx(const uint8_t* data, size_t len) {
     if (len > kMaxEncodedTxBytes) return false;
     TxMessage msg;
@@ -376,10 +340,6 @@ class Client {
     close_reason_ = reason;
   }
 
-  // -------------------------------------------------------------------------
-  // Inbound
-  // -------------------------------------------------------------------------
-
   static void ws_event_trampoline(void* arg, esp_event_base_t base, int32_t id, void* data) {
     static_cast<Client*>(arg)->on_ws_event(base, id, static_cast<esp_websocket_event_data_t*>(data));
   }
@@ -392,13 +352,11 @@ class Client {
         socket_connected_ = true;
         xEventGroupSetBits(events_, kBitSocketUp);
         break;
-
       case WEBSOCKET_EVENT_DISCONNECTED:
       case WEBSOCKET_EVENT_CLOSED:
         socket_connected_ = false;
         xEventGroupSetBits(events_, kBitSocketDown);
         break;
-
       case WEBSOCKET_EVENT_ERROR:
         if (data != nullptr) {
           ESP_LOGW(TAG, "WebSocket error (type %d, http status %d, sock errno %d)",
@@ -409,18 +367,14 @@ class Client {
         socket_connected_ = false;
         xEventGroupSetBits(events_, kBitSocketDown);
         break;
-
       case WEBSOCKET_EVENT_DATA:
         if (data != nullptr) on_ws_data(data);
         break;
-
       default:
         break;
     }
   }
 
-  // Reassembles one protocol message from however many DATA events the client
-  // splits it across (an 8214-byte FRAME does not fit one 4KB read).
   void on_ws_data(const esp_websocket_event_data_t* d) {
     last_rx_us_ = now_us();
 
@@ -430,7 +384,7 @@ class Client {
       xEventGroupSetBits(events_, kBitSocketDown);
       return;
     }
-    if (op == WS_TRANSPORT_OPCODES_PING || op == WS_TRANSPORT_OPCODES_PONG) return;  // transport-level
+    if (op == WS_TRANSPORT_OPCODES_PING || op == WS_TRANSPORT_OPCODES_PONG) return;
     if (op == WS_TRANSPORT_OPCODES_TEXT) {
       ESP_LOGW(TAG, "ignoring a text WebSocket message; Protocol v1 is binary only");
       return;
@@ -451,8 +405,6 @@ class Client {
       if (!rx_overflow_) {
         rx_overflow_ = true;
         if (total > kMaxRxCapacity) {
-          // §3.5(4): a declared length above MAX_PAYLOAD_BYTES is fatal, and
-          // must not be used to size a read.
           ESP_LOGE(TAG, "message of %u bytes exceeds the protocol maximum", static_cast<unsigned>(total));
           request_close("declared length exceeds MAX_PAYLOAD_BYTES");
         } else {
@@ -461,13 +413,10 @@ class Client {
           ++messages_rejected_;
         }
       }
-      return;  // nothing is copied, so nothing can overrun
+      return;
     }
     if (rx_overflow_) return;
 
-    // Defensive: the library should never hand us a chunk that runs past the
-    // declared total, but this buffer is the one thing between the network and
-    // an out-of-bounds write.
     if (offset > rx_capacity_ || chunk > rx_capacity_ - offset) {
       ESP_LOGE(TAG, "dropping a chunk that would overrun the receive buffer (offset %u, len %u, cap %u)",
                static_cast<unsigned>(offset), static_cast<unsigned>(chunk),
@@ -498,7 +447,6 @@ class Client {
 
       msp::StatusCode code;
       if (status_code_for(result, &code)) send_status(code, parse_result_name(result));
-      // §3.5: framing corruption is fatal; a well-framed bad message is not.
       if (is_fatal(result)) request_close(parse_result_name(result));
       return;
     }
@@ -517,7 +465,7 @@ class Client {
         break;
 
       case msp::MessageType::kFrame:
-        on_frame(m);
+        if (!ota::active()) on_frame(m);
         break;
 
       case msp::MessageType::kBrightness: {
@@ -563,15 +511,49 @@ class Client {
         }
         break;
 
+      case msp::MessageType::kOtaBegin:
+        handle_ota_result("OTA_BEGIN", ota::begin(m.ota_image_size));
+        break;
+
+      case msp::MessageType::kOtaData:
+        handle_ota_result("OTA_DATA", ota::write(m.ota_data.offset, m.ota_data.data, m.ota_data.data_len));
+        break;
+
+      case msp::MessageType::kOtaCommit: {
+        const ota::Result ota_result = ota::commit();
+        if (ota_result == ota::Result::kOk) {
+          send_status(msp::StatusCode::kOk, "ota committed; rebooting");
+          reboot_requested_ = true;
+        } else {
+          handle_ota_result("OTA_COMMIT", ota_result);
+        }
+        break;
+      }
+
       case msp::MessageType::kHello:
-        // Well-formed but server->device is not a direction HELLO travels.
         ESP_LOGW(TAG, "ignoring a HELLO from the server (wrong direction for this message type)");
         break;
     }
   }
 
+  void handle_ota_result(const char* operation, ota::Result result) {
+    if (result == ota::Result::kOk) {
+      ESP_LOGI(TAG, "%s ok (%lu/%lu bytes)", operation, static_cast<unsigned long>(ota::bytes_written()),
+               static_cast<unsigned long>(ota::expected_size()));
+      send_status(msp::StatusCode::kOk, operation);
+      return;
+    }
+
+    ++messages_rejected_;
+    ESP_LOGW(TAG, "%s failed: %s", operation, ota::result_name(result));
+    const bool image_error = result == ota::Result::kInvalidSize || result == ota::Result::kNoUpdatePartition ||
+                             result == ota::Result::kBeginFailed || result == ota::Result::kWriteFailed ||
+                             result == ota::Result::kEndFailed || result == ota::Result::kSetBootFailed;
+    send_status(image_error ? msp::StatusCode::kErrOtaImage : msp::StatusCode::kErrOtaState,
+                ota::result_name(result));
+  }
+
   void on_frame(const Message& m) {
-    // §3.5(5)/§4.3: dimensions must match what we advertised in HELLO.
     if (m.frame.width != board::kPanelWidth || m.frame.height != board::kPanelHeight) {
       ++messages_rejected_;
       ESP_LOGW(TAG, "FRAME is %ux%u but this panel is %ux%u; discarding", m.frame.width, m.frame.height,
@@ -607,10 +589,6 @@ class Client {
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Render-task commands
-  // -------------------------------------------------------------------------
-
   void post_command(const DisplayCommand& cmd) {
     if (commands_ == nullptr) return;
     if (xQueueSend(commands_, &cmd, 0) != pdTRUE) ESP_LOGW(TAG, "display command queue full");
@@ -630,8 +608,6 @@ class Client {
     post_command(cmd);
   }
 
-  // -------------------------------------------------------------------------
-
   FrameQueue* frames_ = nullptr;
   QueueHandle_t commands_ = nullptr;
   EventGroupHandle_t events_ = nullptr;
@@ -649,6 +625,7 @@ class Client {
   volatile bool handshaked_ = false;
   volatile bool close_requested_ = false;
   const char* close_reason_ = "";
+  bool reboot_requested_ = false;
   bool streaming_ = false;
   bool no_signal_ = false;
 

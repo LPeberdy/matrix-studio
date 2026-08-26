@@ -2,377 +2,293 @@
 
 **Status: Protocol v1 frozen.**
 
-**Errata note:** after the Home Assistant and ESP32 sides were built
-independently against this document, both reported (via their own
-`PROTOCOL_ISSUES.md`) a handful of genuine lifecycle ambiguities — places
-where the prose supported two readings. Both implementations happened to
-converge on the same reading in every case. The protocol owner (this
-document) has since clarified those spots in place (§3.1, §3.2, §3.5, §4.5,
-§5) to match the interpretation both sides already implemented. **No wire
-bytes, field layouts, or message semantics changed** — this is documentation
-catching up to an ambiguity that implementation already resolved, not a
-protocol revision, so it did not require a version bump or changes to either
-implementation.
-
 This document is the single source of truth for how the Home Assistant side
-("server") and the ESP32-S3 side ("device") of Matrix Studio talk to each
-other. Once frozen, implementation agents on either side MUST NOT change
-message semantics, field layouts, or lifecycle rules described here. If a
-genuine contract problem is discovered, it must be reported back rather than
-patched unilaterally — see `docs/architecture.md` for the change process.
-
-Machine-readable copies of the constants in this document live in
+("server") and ESP32-S3 side ("device") of Matrix Studio communicate. The
+machine-readable equivalents are
 [`protocol/matrix_studio_protocol.py`](../protocol/matrix_studio_protocol.py)
-(Python, used by the Home Assistant side and to generate fixtures) and
-[`protocol/matrix_studio_protocol.h`](../protocol/matrix_studio_protocol.h)
-(C++ header, used by the ESP32 firmware). Golden binary test vectors live in
-[`protocol/fixtures/`](../protocol/fixtures/) with a manifest describing the
-expected parse of each one — both sides must pass tests against these
-fixtures.
+and [`protocol/matrix_studio_protocol.h`](../protocol/matrix_studio_protocol.h).
+Implementations MUST NOT change message semantics, field layouts, lifecycle
+rules, or message allocations unilaterally.
 
 ## 1. Transport
 
-- The connection is a single persistent **WebSocket** connection carrying
-  **binary** frames, one WebSocket message per protocol message.
-- **The ESP32 device is the WebSocket client.** It connects out to
-  `ws://<home-assistant-host>:7887/matrix-studio` (host, port, and path are
-  configurable on the device side; 7887 is the default). The Home Assistant
-  add-on is the WebSocket **server** and listens on that port.
-- Rationale: a device-initiates-outbound model needs no discovery/mDNS in the
-  MVP, works through typical home NAT/AP setups without inbound firewall
-  rules on the HA host, and lets the device apply a simple reconnect loop
-  against a fixed address. The server can serve multiple device connections
-  concurrently in the future without protocol changes.
-- Each WebSocket binary message is exactly one protocol message: an 8-byte
-  header (§2) followed by that message's payload. The header's `length`
-  field is redundant with the WebSocket frame length but is kept so that
-  fixtures and validation logic are transport-agnostic (a future raw-TCP or
-  file-replay transport could reuse the same parser).
+- One persistent **binary WebSocket** connection.
+- The ESP32 is the WebSocket client and connects to
+  `ws://<home-assistant-host>:7887/matrix-studio` by default.
+- The Home Assistant add-on is the server.
+- Each WebSocket binary message contains exactly one Matrix Studio protocol
+  message: an 8-byte header followed by its payload.
+- The device initiates the connection so no inbound connection, discovery or
+  mDNS is required on the ESP32.
 
 ## 2. Message header
 
-Every message, in both directions, starts with this fixed 8-byte header:
+Every message starts with:
 
-| Offset | Field     | Type   | Notes                                        |
-|-------:|-----------|--------|-----------------------------------------------|
-| 0      | `magic`   | u8     | Always `0xA5`                                  |
-| 1      | `version` | u8     | Protocol version. `1` for this document.       |
-| 2      | `type`    | u8     | Message type, see §4                           |
-| 3      | `flags`   | u8     | Reserved, must be `0x00` in v1                  |
-| 4      | `length`  | u32 LE | Payload length in bytes, **not** including header |
+| Offset | Field | Type | Notes |
+|---:|---|---|---|
+| 0 | `magic` | `u8` | Always `0xA5` |
+| 1 | `version` | `u8` | `1` |
+| 2 | `type` | `u8` | Message type from §4 |
+| 3 | `flags` | `u8` | Reserved, `0x00` in v1 |
+| 4 | `length` | `u32 LE` | Payload bytes, excluding header |
 
-**Byte ordering: all multi-byte integer fields in this protocol, in the
-header and in every payload, are little-endian.** This matches the native
-endianness of both the ESP32-S3 (Xtensa LX7, little-endian) and the Raspberry
-Pi (aarch64, little-endian), avoiding byte-swapping on both ends.
-
-Total message size = 8 + `length` bytes. `length` MUST NOT exceed
-`MAX_PAYLOAD_BYTES = 65535`. A frame payload for the 64x64 RGB565 MVP is
-exactly 8192 bytes.
+All multi-byte integers are little-endian. `length` MUST NOT exceed
+`MAX_PAYLOAD_BYTES = 65535`.
 
 ## 3. Connection lifecycle
 
-1. Device opens the WebSocket connection to the server.
-2. Device MUST send `HELLO` (§4.1) within `HELLO_TIMEOUT_MS = 5000` of the
-   socket opening. If it does not, the server closes the connection.
-3. Server validates `HELLO.protocol_version`:
-   - If unsupported, server sends `STATUS` (§4.8) with
-     `code = ERR_UNSUPPORTED_VERSION`, then closes the connection.
-   - If supported, server replies with `HELLO_ACK` (§4.2).
-4. After `HELLO_ACK`, the server may begin streaming `FRAME` (§4.3) messages,
-   and either side may send `BRIGHTNESS` (§4.4), `BLANK` (§4.5), `PING`/`PONG`
-   (§4.6/§4.7), or `STATUS` (§4.8) at any time.
-5. Frame cadence is **not guaranteed** — the server sends frames as fast as
-   the active scene renders (target 20-30 FPS), and may pause entirely (e.g.
-   scene error, no active scene). The device must not treat a gap in frames
-   as a protocol error by itself; see §3.2 (frame timeout).
-6. `FRAME.sequence` starts at 0 for each new connection/session and
-   increments by 1 for every frame sent on that connection. Gaps are
-   possible if the server intentionally drops a stale frame (e.g. it is
-   behind); the device does not need to detect gaps, only render what it
-   receives.
+1. Device opens the WebSocket connection.
+2. Device sends `HELLO` within `HELLO_TIMEOUT_MS = 5000`.
+3. Server validates the protocol version, panel dimensions and pixel format.
+4. Server replies with `HELLO_ACK` when accepted.
+5. The session is then established. Normal frame/control traffic and OTA
+   traffic may use the same connection according to the rules below.
+6. `FRAME.sequence` begins at zero for every new session and increments by one
+   for every frame sent. Gaps are legal.
 
 ### 3.1 Heartbeat
 
-- Either side MAY send `PING` at any time (recommended: server every
-  `PING_INTERVAL_MS = 10000` while idle, i.e. when not actively streaming
-  frames — an in-flight frame stream is itself evidence of liveness).
-- The recipient of a `PING` MUST reply with `PONG` carrying the same
-  `nonce`, as soon as possible.
-- If a `PING` is not answered within `PONG_TIMEOUT_MS = 10000`, the sender
-  MUST treat the connection as dead: close it and (if it is the device)
-  begin the reconnect procedure in §3.3.
-- **At most one `PING` may be outstanding at a time per sender.** Since
-  `PING_INTERVAL_MS` and `PONG_TIMEOUT_MS` are equal, a sender that fires a
-  new `PING` on every interval tick regardless of outstanding ones can
-  declare a merely-slow link dead right as the next `PING` is due. Instead:
-  if a `PING` is already outstanding when the next interval elapses, do not
-  send another — just keep checking the outstanding one's age against
-  `PONG_TIMEOUT_MS`, and only close once that deadline is strictly
-  exceeded. A `PONG` whose `nonce` doesn't match the outstanding `PING` is
-  ignored as a heartbeat reply (but still counts as evidence of a live
-  socket).
+- Either side MAY send `PING`.
+- A recipient MUST reply with `PONG` carrying the same nonce.
+- At most one `PING` may be outstanding per sender.
+- An unanswered ping older than `PONG_TIMEOUT_MS = 10000` makes the connection
+  dead.
+- Active frame or OTA traffic is itself evidence of liveness.
 
-### 3.2 Frame timeout / no-signal behaviour
+### 3.2 Frame timeout / no-signal
 
-- The device tracks the time since the last `FRAME` it received.
-- If no `FRAME` arrives for `FRAME_TIMEOUT_MS = 5000` (configurable), the
-  device enters a **local "no signal" state**: it should stop trying to
-  interpret stale pixel data and show a quiet fallback (e.g. blank panel or
-  a small idle indicator), without closing the WebSocket connection. Normal
-  rendering resumes automatically on the next `FRAME`.
-- This is deliberately decoupled from the heartbeat/connection-liveness
-  logic in §3.1: a connection can be alive with no frames (idle scene), and
-  the device should not reconnect just because frames paused.
-- **`BLANK(1)` (§4.5) takes precedence over this no-signal fallback.** While
-  explicitly blanked, a device must not show a no-signal indicator (that
-  would contradict the explicit "go dark" command); it should simply stay
-  blank. A server that honors `BLANK(1)` by pausing its `FRAME` stream (the
-  expected implementation — see §4.5) is not thereby telling the device
-  anything has gone wrong, and the device's own frame-timeout clock is
-  irrelevant until `BLANK(0)` resumes normal streaming.
+If the device receives no `FRAME` for `FRAME_TIMEOUT_MS = 5000`, it enters a
+local no-signal state without disconnecting. A later frame resumes rendering.
+An explicit `BLANK(1)` takes precedence over the no-signal indicator.
+
+No-signal behaviour is suspended during an active OTA transaction because the
+server intentionally pauses frame streaming while updating firmware.
 
 ### 3.3 Reconnection
 
-- If the WebSocket connection closes or fails for any reason (explicit
-  close, TCP error, failed heartbeat, Wi-Fi loss), the device reconnects
-  using exponential backoff: `1s, 2s, 4s, 8s, 16s, 30s, 30s, ...` (capped at
-  `RECONNECT_MAX_BACKOFF_S = 30`).
-- On Wi-Fi loss specifically, the device first re-establishes Wi-Fi, then
-  applies the same backoff to the WebSocket connection.
-- Every new connection is a new session: `FRAME.sequence` resets to 0, and
-  the device must send a fresh `HELLO`.
-- The server does not need to persist any per-device session state across
-  reconnects in v1; each connection is handshaked from scratch.
+On WebSocket failure or Wi-Fi loss the device reconnects with exponential
+backoff:
 
-### 3.4 Server restart / disappearance
+`1s, 2s, 4s, 8s, 16s, 30s, 30s, ...`
 
-- From the device's point of view, a server restart looks like a dropped
-  connection; the device applies §3.3 unconditionally, with no special case.
-- The Home Assistant add-on must survive having zero connected devices
-  indefinitely (i.e. the device being unplugged, unflashed, or never
-  connected is a normal, healthy state — not an error state for the server).
+The maximum is `RECONNECT_MAX_BACKOFF_S = 30`. A new connection always begins
+with a fresh `HELLO` and a new session.
+
+### 3.4 Server restart / zero devices
+
+A server restart is just a dropped connection to the device. The Home
+Assistant add-on MUST remain healthy indefinitely with zero connected devices.
 
 ### 3.5 Malformed-message handling
 
-On receipt of any message, the receiver validates, in order:
+Receivers validate messages in this order:
 
-1. `magic == 0xA5` — else discard the message, log it, and close the
-   connection (a bad magic byte means the stream is desynchronized and
-   cannot be trusted further).
-2. `version` matches the version negotiated at `HELLO`/`HELLO_ACK` — else
-   send `STATUS(ERR_UNSUPPORTED_VERSION)` and close.
-3. `type` is a known message type (or within the reserved extension range,
-   §5) — else send `STATUS(ERR_UNKNOWN_TYPE)` and continue (do not close;
-   unknown types in the extension range are expected to be safely ignorable
-   in the future).
-4. `length` does not exceed `MAX_PAYLOAD_BYTES` — else close the connection
-   without attempting to read the declared payload.
-5. For message types with a fixed or computable payload size (e.g. `FRAME`
-   implies `width * height * bytes_per_pixel`), the actual payload size
-   must match — else send `STATUS(ERR_MALFORMED_PAYLOAD)` and discard just
-   that message (do not close the connection; a single bad frame should not
-   drop an otherwise-healthy session). **This rule also covers the case
-   where `header.length` is itself legal (≤ `MAX_PAYLOAD_BYTES`) but the
-   bytes actually received for this message are fewer than `length`
-   declares** — e.g. the `truncated_frame` fixture, where a well-formed
-   header claims a full 8206-byte `FRAME` payload but only 100 bytes
-   follow. On a message-oriented transport (§1: one WebSocket message per
-   protocol message), that size mismatch is detected as soon as the
-   WebSocket message ends, without needing to block waiting for more bytes
-   that a byte-stream transport might legitimately still be delivering.
-   Treat it exactly like any other payload-size mismatch: `STATUS
-   (ERR_MALFORMED_PAYLOAD)`, discard, keep the connection.
-6. A message that is well-formed per rules 1-5 but arrives in an
-   unexpected context — a second `HELLO` on an already-handshaked
-   connection, or a message arriving in the direction it's not defined for
-   (e.g. `FRAME` from a device) — is not a framing error and must not close
-   the connection. Log it and ignore it, continuing the session with
-   whatever state was already established (e.g. a duplicate `HELLO`'s
-   parameters do not replace the original session's).
+1. bad `magic`: close;
+2. unsupported `version`: send `STATUS(ERR_UNSUPPORTED_VERSION)`, then close;
+3. unknown non-extension type: send `STATUS(ERR_UNKNOWN_TYPE)`, continue;
+4. `length > MAX_PAYLOAD_BYTES`: close without trusting the payload;
+5. incorrect payload size/content: send `STATUS(ERR_MALFORMED_PAYLOAD)`, discard
+   that message and continue;
+6. well-formed message in the wrong direction/context: log and ignore.
 
-In short: corruption of the framing itself (magic/version) is fatal to the
-connection; a malformed but well-framed individual message is logged and
-discarded, whether the malformation is a bad declared length, a truncated
-payload, or an out-of-context message. Implementations must never crash on
-malformed input — this is covered by the "malformed header" / "truncated
-frame" fixtures.
+Implementations must never read past the received WebSocket message or crash on
+malformed input.
+
+### 3.6 OTA lifecycle
+
+OTA is a first-class Protocol v1 operation over the same WebSocket connection.
+It is deliberately transactional rather than a remote shell or general-purpose
+management channel.
+
+1. Server pauses `FRAME` streaming for that device.
+2. Server sends `OTA_BEGIN(image_size)`.
+3. Device selects the inactive OTA partition and replies `STATUS(OK)` or an
+   OTA error.
+4. Server sends sequential `OTA_DATA(offset, data)` messages. Chunks are at
+   most `OTA_MAX_CHUNK_BYTES = 4096` bytes. `offset` must equal the number of
+   firmware bytes already accepted.
+5. Device writes each chunk directly using ESP-IDF OTA APIs and replies with
+   `STATUS(OK)` or an OTA error.
+6. After exactly `image_size` bytes, server sends `OTA_COMMIT`.
+7. Device finalizes and validates the ESP-IDF application image, selects the
+   completed inactive partition for next boot, replies `STATUS(OK)`, then
+   reboots.
+8. A newly OTA-booted image remains pending until Matrix Studio completes its
+   core startup path and marks it valid. ESP-IDF rollback returns to the prior
+   image if validation fails.
+9. If the connection disappears before commit, the device aborts the pending
+   OTA transaction and keeps the current running firmware selected.
+
+A device MUST NOT accept a second `OTA_BEGIN` while a transaction is active.
+Normal `FRAME` messages received during OTA may be ignored. Heartbeats and
+`STATUS` remain valid during the transaction.
 
 ## 4. Message types
 
-`type` values:
+| Value | Name | Direction |
+|---:|---|---|
+| `0x01` | `HELLO` | device -> server |
+| `0x02` | `HELLO_ACK` | server -> device |
+| `0x03` | `FRAME` | server -> device |
+| `0x04` | `BRIGHTNESS` | server -> device |
+| `0x05` | `BLANK` | server -> device |
+| `0x06` | `PING` | either |
+| `0x07` | `PONG` | either |
+| `0x08` | `STATUS` | either |
+| `0x09` | `OTA_BEGIN` | server -> device |
+| `0x0A` | `OTA_DATA` | server -> device |
+| `0x0B` | `OTA_COMMIT` | server -> device |
 
-| Value  | Name          | Direction        |
-|--------|---------------|------------------|
-| `0x01` | `HELLO`       | device -> server |
-| `0x02` | `HELLO_ACK`   | server -> device |
-| `0x03` | `FRAME`       | server -> device |
-| `0x04` | `BRIGHTNESS`  | server -> device |
-| `0x05` | `BLANK`       | server -> device |
-| `0x06` | `PING`        | either           |
-| `0x07` | `PONG`        | either           |
-| `0x08` | `STATUS`      | either           |
+### 4.1 `HELLO` (`0x01`)
 
-### 4.1 `HELLO` (0x01, device -> server)
+| Offset | Field | Type | Notes |
+|---:|---|---|---|
+| 0 | `protocol_version` | `u8` | `1` |
+| 1 | `width` | `u16 LE` | `64` for current panel |
+| 3 | `height` | `u16 LE` | `64` for current panel |
+| 5 | `pixel_format` | `u8` | `0x01 = RGB565` |
+| 6 | `device_id` | 16 bytes | UTF-8/ASCII, NUL-padded |
+| 22 | `fw_version` | 16 bytes | UTF-8, NUL-padded |
 
-| Offset | Field              | Type      | Notes                              |
-|-------:|--------------------|-----------|-------------------------------------|
-| 0      | `protocol_version` | u8        | `1`                                  |
-| 1      | `width`            | u16 LE    | Panel width in pixels, `64` for MVP  |
-| 3      | `height`           | u16 LE    | Panel height in pixels, `64` for MVP |
-| 5      | `pixel_format`     | u8        | `0x01 = RGB565` (only defined value) |
-| 6      | `device_id`        | 16 bytes  | Stable device identifier (e.g. derived from MAC address), ASCII/UTF-8, NUL-padded |
-| 22     | `fw_version`       | 16 bytes  | Firmware version string, UTF-8, NUL-padded |
+Payload: 38 bytes.
 
-Payload length: 38 bytes.
+### 4.2 `HELLO_ACK` (`0x02`)
 
-### 4.2 `HELLO_ACK` (0x02, server -> device)
+| Offset | Field | Type |
+|---:|---|---|
+| 0 | `protocol_version` | `u8` |
+| 1 | `frame_interval_hint_ms` | `u16 LE` |
+| 3 | `server_time_unix` | `u32 LE` |
 
-| Offset | Field              | Type   | Notes                                     |
-|-------:|--------------------|--------|--------------------------------------------|
-| 0      | `protocol_version` | u8     | Echoes the accepted version                |
-| 1      | `frame_interval_hint_ms` | u16 LE | Advisory only; device is not required to enforce it |
-| 3      | `server_time_unix` | u32 LE | Seconds since epoch, for device RTC sync (best-effort; `0` if unknown) |
+Payload: 7 bytes.
 
-Payload length: 7 bytes.
+### 4.3 `FRAME` (`0x03`)
 
-### 4.3 `FRAME` (0x03, server -> device)
+| Offset | Field | Type |
+|---:|---|---|
+| 0 | `sequence` | `u32 LE` |
+| 4 | `timestamp_ms` | `u32 LE` |
+| 8 | `width` | `u16 LE` |
+| 10 | `height` | `u16 LE` |
+| 12 | `pixel_format` | `u8` |
+| 13 | `reserved` | `u8` |
+| 14 | `pixels` | bytes |
 
-| Offset | Field          | Type     | Notes                                  |
-|-------:|----------------|----------|------------------------------------------|
-| 0      | `sequence`     | u32 LE   | Monotonically increasing per session      |
-| 4      | `timestamp_ms` | u32 LE   | Optional; milliseconds since server start, `0` if unused |
-| 8      | `width`        | u16 LE   | Must match `HELLO.width`                  |
-| 10     | `height`       | u16 LE   | Must match `HELLO.height`                 |
-| 12     | `pixel_format` | u8       | `0x01 = RGB565`                           |
-| 13     | `reserved`     | u8       | `0x00`                                    |
-| 14     | `pixels`       | bytes    | `width * height * 2` bytes, row-major, top-left origin, each pixel a little-endian RGB565 u16 |
+Pixels are row-major, top-left origin, little-endian RGB565. Payload length is
+`14 + width*height*2`; for 64×64, 8206 bytes.
 
-Payload length: `14 + width*height*2`. For the 64x64 MVP: `14 + 8192 = 8206`
-bytes.
+### 4.4 `BRIGHTNESS` (`0x04`)
 
-RGB565 packing per pixel (16 bits): `RRRRR GGGGGG BBBBB` (5 red / 6 green / 5
-blue bits), stored as a little-endian `u16`.
+One `u8`, `0..255`.
 
-### 4.4 `BRIGHTNESS` (0x04, server -> device)
+### 4.5 `BLANK` (`0x05`)
 
-| Offset | Field        | Type | Notes                       |
-|-------:|--------------|------|------------------------------|
-| 0      | `brightness` | u8   | `0` (off) .. `255` (max)     |
+One `u8`: `1` forces the panel dark, `0` resumes normal rendering.
 
-Payload length: 1 byte. The device applies this as a global panel brightness
-scaler; it does not affect the pixel values it receives.
+### 4.6 `PING` (`0x06`)
 
-### 4.5 `BLANK` (0x05, server -> device)
+One `u32 LE` nonce.
 
-| Offset | Field   | Type | Notes                                    |
-|-------:|---------|------|--------------------------------------------|
-| 0      | `blank` | u8   | `1` = force display off/blank, `0` = resume normal rendering |
+### 4.7 `PONG` (`0x07`)
 
-Payload length: 1 byte. Distinct from §3.2's no-signal state: `BLANK` is an
-explicit server command (e.g. "night mode"), while no-signal is the device's
-own fallback when frames stop arriving. The expected server implementation
-pauses its `FRAME` stream while blanked (there is little point rendering and
-sending frames nobody sees) and sends `BLANK(0)` before resuming; see §3.2
-for why the device must not treat that pause as a no-signal condition.
+One `u32 LE` nonce matching the `PING` being answered.
 
-### 4.6 `PING` (0x06, either direction)
+### 4.8 `STATUS` (`0x08`)
 
-| Offset | Field   | Type   | Notes                          |
-|-------:|---------|--------|----------------------------------|
-| 0      | `nonce` | u32 LE | Arbitrary value, echoed in `PONG` |
-
-Payload length: 4 bytes.
-
-### 4.7 `PONG` (0x07, either direction)
-
-| Offset | Field   | Type   | Notes                        |
-|-------:|---------|--------|--------------------------------|
-| 0      | `nonce` | u32 LE | Must equal the `PING` it answers |
-
-Payload length: 4 bytes.
-
-### 4.8 `STATUS` (0x08, either direction)
-
-| Offset | Field     | Type   | Notes                                   |
-|-------:|-----------|--------|--------------------------------------------|
-| 0      | `code`    | u16 LE | See status codes table below               |
-| 2      | `message` | bytes  | UTF-8, remainder of payload, not NUL-terminated |
-
-Payload length: `2 + len(message)`. `message` may be zero-length.
+| Offset | Field | Type |
+|---:|---|---|
+| 0 | `code` | `u16 LE` |
+| 2 | `message` | UTF-8 bytes to end of payload |
 
 Status codes:
 
-| Code     | Name                      | Meaning                                  |
-|---------:|---------------------------|--------------------------------------------|
-| `0x0000` | `OK`                      | Informational, non-error status            |
-| `0x0001` | `ERR_UNSUPPORTED_VERSION` | Sender's protocol version is not supported |
-| `0x0002` | `ERR_UNKNOWN_TYPE`        | Message type not recognized                |
-| `0x0003` | `ERR_MALFORMED_PAYLOAD`   | Payload length/content invalid for its type|
-| `0x0004` | `ERR_DIMENSION_MISMATCH`  | `FRAME` dimensions don't match `HELLO`     |
-| `0x0005` | `ERR_INTERNAL`            | Sender-side internal error, connection may continue |
+| Code | Name | Meaning |
+|---:|---|---|
+| `0x0000` | `OK` | Operation accepted/completed |
+| `0x0001` | `ERR_UNSUPPORTED_VERSION` | Protocol version unsupported |
+| `0x0002` | `ERR_UNKNOWN_TYPE` | Message type unknown |
+| `0x0003` | `ERR_MALFORMED_PAYLOAD` | Payload invalid |
+| `0x0004` | `ERR_DIMENSION_MISMATCH` | Frame/panel dimensions disagree |
+| `0x0005` | `ERR_INTERNAL` | Internal implementation failure |
+| `0x0006` | `ERR_OTA_STATE` | OTA transaction is in an invalid state/order |
+| `0x0007` | `ERR_OTA_IMAGE` | OTA partition/image/write/finalization failure |
+
+### 4.9 `OTA_BEGIN` (`0x09`)
+
+| Offset | Field | Type |
+|---:|---|---|
+| 0 | `image_size` | `u32 LE` |
+
+Payload: 4 bytes. `image_size` must be greater than zero and fit the inactive
+OTA application partition.
+
+### 4.10 `OTA_DATA` (`0x0A`)
+
+| Offset | Field | Type |
+|---:|---|---|
+| 0 | `offset` | `u32 LE` |
+| 4 | `data` | 1..4096 bytes |
+
+Payload: `4 + len(data)`. Chunks are sequential and may not extend beyond the
+size declared by `OTA_BEGIN`.
+
+### 4.11 `OTA_COMMIT` (`0x0B`)
+
+Empty payload. Valid only when the device has received exactly the declared
+image size.
 
 ## 5. Extension mechanism
 
-- `type` values `0x80`-`0xFE` are reserved for future/vendor extensions.
-  Per §3.5 rule 3, a receiver that does not recognize a type in this range
-  (or any other unknown type) MUST NOT treat it as fatal to the
-  connection: reply `STATUS(ERR_UNKNOWN_TYPE)` and continue processing
-  further messages on the same connection — "ignore that single message"
-  means exactly this, not that the reply is skipped. A future receiver that
-  understands a given extension type handles it instead of replying
-  `STATUS`, same as for any type it has learned to recognize.
-- `type` value `0xFF` is reserved (do not use).
-- `flags` (header byte 3) is reserved and must be `0` in v1. A receiver
-  MUST NOT reject a message solely for having nonzero `flags` bits — §3.5's
-  validation steps intentionally do not check `flags` at all, so that
-  future versions can define bits here without changing the header layout
-  or breaking v1 receivers talking to a newer sender. Logging an
-  unexpected nonzero value is reasonable; closing the connection over it
-  is not.
-- New fields are always added at the **end** of an existing message's
-  payload in future protocol versions; existing field offsets never change
-  within a version. A receiver on an older version simply has a shorter
-  `length` and ignores fields it doesn't know about, as governed by that
-  future version's own compatibility notes.
-- Adding an entirely new message type does not require a version bump;
-  changing the meaning or layout of an existing message type does.
+- `0x80..0xFE` remain reserved for future/vendor extensions.
+- Unknown extension-range messages are non-fatal: reply
+  `STATUS(ERR_UNKNOWN_TYPE)` and continue.
+- `0xFF` is reserved and must not be allocated.
+- Header `flags` remain reserved and zero in v1. A receiver may log unknown
+  non-zero flags but must not close solely because of them.
+- Changing an existing message's semantics/layout requires a deliberate
+  protocol revision. New message types require an explicit allocation in this
+  document before implementation.
 
 ## 6. Limits summary
 
-| Constant                     | Value    |
-|-------------------------------|---------|
-| `PROTOCOL_VERSION`             | 1       |
-| `MAGIC`                        | `0xA5`  |
-| `HEADER_SIZE_BYTES`            | 8       |
-| `MAX_PAYLOAD_BYTES`            | 65535   |
-| `HELLO_TIMEOUT_MS`             | 5000    |
-| `PING_INTERVAL_MS`             | 10000   |
-| `PONG_TIMEOUT_MS`              | 10000   |
-| `FRAME_TIMEOUT_MS` (default)   | 5000    |
-| `RECONNECT_MAX_BACKOFF_S`      | 30      |
-| Default WebSocket port         | 7887    |
-| Default WebSocket path         | `/matrix-studio` |
+| Constant | Value |
+|---|---:|
+| `PROTOCOL_VERSION` | `1` |
+| `MAGIC` | `0xA5` |
+| `HEADER_SIZE_BYTES` | `8` |
+| `MAX_PAYLOAD_BYTES` | `65535` |
+| `HELLO_TIMEOUT_MS` | `5000` |
+| `PING_INTERVAL_MS` | `10000` |
+| `PONG_TIMEOUT_MS` | `10000` |
+| `FRAME_TIMEOUT_MS` | `5000` default |
+| `RECONNECT_MAX_BACKOFF_S` | `30` |
+| `OTA_MAX_CHUNK_BYTES` | `4096` |
+| Default WebSocket port | `7887` |
+| Default WebSocket path | `/matrix-studio` |
 
-## 7. Known operational risk: Wi-Fi/DMA interference
+## 7. Firmware/partition requirement
 
-Hardware research (`docs/hardware.md`) found a documented risk that the
-HUB75 DMA engine's high-frequency output can disturb the ESP32-S3's Wi-Fi
-radio on some boards, surfacing as connection stalls. This protocol was
-deliberately **not** redesigned around UDP to pre-empt that risk: the
-existing heartbeat/timeout/reconnect rules in §3.1 and §3.3 already turn a
-stalled connection into an automatic reconnect rather than a wedged device,
-which is an adequate mitigation for v1. If real-hardware testing shows this
-is insufficient, that is a candidate reason for a deliberate, parent-agent-
-reviewed protocol revision later — not something either side should route
-around unilaterally.
+A production Matrix Studio ESP32 image uses an OTA-capable partition layout
+from the first wired flash: factory application + `ota_0` + `ota_1` +
+`otadata`. Bootloader application rollback is enabled. This is required for
+the OTA lifecycle in §3.6 to be real rather than merely representable on the
+wire.
 
-## 8. Golden fixtures
+The current Hengantech/Seengreat ESP32-S3 controller is documented as the
+ESP32-S3-WROOM-1-N16R8 variant (16 MB flash / 8 MB PSRAM), and the committed
+partition table is sized for that hardware.
 
-See [`protocol/fixtures/`](../protocol/fixtures/) and its `manifest.json` for
-byte-exact test vectors covering: valid `HELLO`, valid 64x64 `FRAME`, valid
-`BRIGHTNESS`, valid `PING`, a malformed header (bad magic), an unsupported
-protocol version, and a truncated frame payload. Both implementations'
-protocol test suites must load and assert against these fixtures so that a
-change to one side's parser that silently diverges from the other is caught
-immediately.
+## 8. Wi-Fi/DMA operational risk
+
+HUB75 DMA activity may interfere with ESP32-S3 Wi-Fi on some hardware. Protocol
+v1 relies on heartbeat, timeout and reconnect behaviour rather than changing
+transport pre-emptively. Real-hardware bring-up must validate sustained
+24 FPS streaming and reconnect counters.
+
+## 9. Golden fixtures and tests
+
+`protocol/fixtures/` contains byte-exact fixtures for the primary connection
+and rendering messages plus malformed cases. Protocol tests additionally
+round-trip the OTA messages. Both the Python reference implementation and the
+ESP32 host parser must agree on the same constants and layouts.

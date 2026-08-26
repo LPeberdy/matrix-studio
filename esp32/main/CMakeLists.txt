@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "app_main.cpp"
         "board_config.cpp"
+        "ota_updater.cpp"
         "psram_info.cpp"
         "serial_console.cpp"
         "display/display.cpp"
@@ -24,6 +25,7 @@ idf_component_register(
         esp_wifi
         nvs_flash
     PRIV_REQUIRES
+        app_update
         esp_app_format
         esp_hw_support
         esp_psram
