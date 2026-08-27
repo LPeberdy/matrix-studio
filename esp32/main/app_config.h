@@ -75,7 +75,7 @@ constexpr bool kSerialCommands = false;
 
 // Reported to the server in HELLO.fw_version (max 16 bytes, docs/protocol.md
 // §4.1).
-constexpr const char* kFirmwareVersion = "0.1.1";
+constexpr const char* kFirmwareVersion = "0.1.2";
 
 }  // namespace config
 }  // namespace matrix_studio

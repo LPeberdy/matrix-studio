@@ -151,6 +151,31 @@ class FrameBus:
         for subscription in self._subscriptions:
             subscription.wake()
 
+    async def next_after(self, timestamp_ms: int, *, timeout: float = 5.0) -> RenderedFrame | None:
+        """Wait for a frame whose timestamp differs from ``timestamp_ms``.
+
+        Subscribing before checking ``latest`` closes the publish/check race:
+        a frame arriving between those operations is retained by the
+        subscription. The timeout keeps an ingress proxy from holding an idle
+        request forever when the engine is blanked or stopped.
+        """
+        with self.subscribe() as subscription:
+            latest = self._latest
+            if latest is not None and latest.timestamp_ms != timestamp_ms:
+                return latest
+            try:
+                while True:
+                    frame = await asyncio.wait_for(subscription.get(), timeout=timeout)
+                    if frame is None:
+                        # Controls changed without a rendered frame. Return the
+                        # latest snapshot so the HTTP layer can promptly
+                        # re-evaluate blanking instead of holding for timeout.
+                        return self._latest
+                    if frame.timestamp_ms != timestamp_ms:
+                        return frame
+            except (asyncio.TimeoutError, TimeoutError):
+                return self._latest
+
     @contextlib.contextmanager
     def subscribe(self) -> Iterator[_Subscription]:
         subscription = _Subscription()

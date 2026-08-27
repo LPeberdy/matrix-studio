@@ -2,8 +2,6 @@
 // All URLs are relative so the page works under Home Assistant's ingress
 // prefix (set via <base href> by web.py) and standalone.
 
-const PREVIEW_FPS = 24;
-const PREVIEW_INTERVAL_MS = 1000 / PREVIEW_FPS;
 const STATUS_INTERVAL_MS = 1000;
 
 const el = (id) => document.getElementById(id);
@@ -11,8 +9,8 @@ let sceneOptionsKey = "";
 let otaDevicesKey = "";
 let brightnessPending = false;
 let otaRequestInFlight = false;
-let previewRequestedAt = 0;
-let previewTimer = null;
+let previewFrame = "";
+let previewObjectUrl = "";
 
 async function post(path, body) {
   const response = await fetch(path, {
@@ -26,18 +24,32 @@ async function post(path, body) {
   return response.json().catch(() => ({}));
 }
 
-function refreshPreview() {
-  // Cache-buster: the endpoint is no-store, but proxies in between may not be.
-  previewRequestedAt = performance.now();
-  el("preview").src = `api/preview.png?scale=1&t=${Date.now()}`;
-}
-
-function schedulePreview() {
-  // A load/error event ends the current request. Base the delay on when it
-  // began so fast responses maintain 24 FPS while slow ones never overlap.
-  const remaining = Math.max(0, PREVIEW_INTERVAL_MS - (performance.now() - previewRequestedAt));
-  clearTimeout(previewTimer);
-  previewTimer = setTimeout(refreshPreview, remaining);
+async function refreshPreview() {
+  try {
+    // The request waits for the next rendered frame. This keeps preview
+    // presentation on the engine clock instead of beating against a separate
+    // browser timer, while still guaranteeing that requests never overlap.
+    const response = await fetch(`api/preview.png?scale=1&after=${previewFrame}`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`preview request failed: HTTP ${response.status}`);
+    const nextFrame = response.headers.get("X-Matrix-Frame") || "";
+    const blob = await response.blob();
+    const nextUrl = URL.createObjectURL(blob);
+    const image = el("preview");
+    image.src = nextUrl;
+    await image.decode().catch(() => {});
+    if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
+    previewObjectUrl = nextUrl;
+    if (nextFrame === "blank") {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    } else if (nextFrame === previewFrame) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    previewFrame = nextFrame;
+    requestAnimationFrame(refreshPreview);
+  } catch (error) {
+    console.error("preview refresh failed", error);
+    setTimeout(refreshPreview, 500);
+  }
 }
 
 function renderScenes(status) {
@@ -247,9 +259,6 @@ el("ota-install").addEventListener("click", async () => {
     refreshStatus();
   }
 });
-
-el("preview").addEventListener("load", schedulePreview);
-el("preview").addEventListener("error", schedulePreview);
 
 refreshStatus();
 refreshPreview();
