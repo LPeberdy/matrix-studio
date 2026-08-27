@@ -75,11 +75,13 @@ async def test_ota_sender_streams_sequential_chunks_and_pauses_frames():
         await ws.send_bytes(proto.Status(proto.StatusCode.OK, "ota committed; rebooting").encode())
 
         await asyncio.wait_for(update, timeout=5)
-        ota = server.connections()[0]["ota"]
-        assert ota["active"] is True
-        assert ota["bytes_sent"] == len(image)
-        assert ota["total_bytes"] == len(image)
-        await ws.close()
+        closing = await asyncio.wait_for(ws.receive(), timeout=1)
+        assert closing.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED)
+        for _ in range(50):
+            if server.device_count == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert server.device_count == 0, "the committed OTA session must not survive the device reboot"
     finally:
         await session.close()
         await server.stop()

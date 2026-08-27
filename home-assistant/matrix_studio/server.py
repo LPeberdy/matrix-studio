@@ -636,8 +636,12 @@ class DeviceServer:
             _LOGGER.info("OTA committed for %s; waiting for device reboot", connection.device_id or connection.remote)
             if connection.ota_done is not None and not connection.ota_done.done():
                 connection.ota_done.set_result(None)
-            # Keep ota_active true until the expected reboot disconnects this
-            # session. The writer therefore sends no more frames on the old boot.
+            # The device has accepted the new boot slot and is about to reboot.
+            # Close our side proactively: a reboot can leave the old TCP socket
+            # half-open, and ota_active deliberately suppresses heartbeats. If
+            # retained, that ghost session receives no frames but remains in
+            # status forever alongside the device's fresh connection.
+            await ws.close(code=_CLOSE_GOING_AWAY, message=b"ota committed")
         except OtaUpdateError as exc:
             connection.ota_last_error = str(exc)
             connection.ota_image = None
