@@ -145,8 +145,54 @@ If a scene raises, the engine logs it and renders a fallback scene instead;
 after three consecutive failures the scene is quarantined until you fix it and
 press **Reload scenes**. The add-on itself never goes down because of a scene.
 
-Built-in scenes: `plasma` (colour test), `starfield`, `landscape`,
-`home_pulse` (reacts to Home Assistant), `testcard` (panel wiring check).
+Built-in scenes: `plasma` (coherently drifting colour test), `starfield`,
+`landscape`, `home_pulse` (reacts to Home Assistant), `testcard` (panel
+wiring check), and `motion_test` (constant 8 px/s cadence reference).
+
+## Animation cadence
+
+The default remains 24 FPS. Testing the original plasma at 24, 30, 40, 48,
+and 60 FPS produced the same periodic slow/fast motion, so renderer frequency
+was not the cause. Its independently timed interference waves were beating
+against each other; the built-in plasma now translates the whole field at one
+constant velocity.
+
+The repeatable renderer-only check sampled ten seconds at each rate and
+compared the busiest and quietest rolling one-second windows of mean absolute
+RGB change. It isolates artwork motion from scheduling and transport:
+
+| Target FPS | Original plasma | Coherent plasma |
+|---:|---:|---:|
+| 24 | 1.157× | 1.000× |
+| 30 | 1.157× | 1.000× |
+| 40 | 1.157× | 1.000× |
+| 48 | 1.157× | 1.000× |
+| 60 | 1.157× | 1.000× |
+
+A value of 1.000× means visual activity remains uniform across the sampled
+windows. The result explains why increasing the original scene to 60 FPS did
+not remove its slow/fast rhythm. The default stays at 24 FPS because higher
+rates add bandwidth without fixing artwork-level cadence.
+
+Use `motion_test` when checking a physical installation. The cyan bar moves at
+exactly 8 pixels/second with fractional edge coverage. If it moves uniformly,
+the renderer/transport/display cadence is healthy and any uneven motion is in
+the selected artwork. If it bunches or jumps, the Devices table shows recent
+send FPS, interval jitter, longest recent gap, and skipped frames.
+
+All configured rates remain supported. A raw 64×64 RGB565 stream uses roughly:
+
+| Target FPS | Payload rate |
+|---:|---:|
+| 24 | 1.57 Mbit/s |
+| 30 | 1.97 Mbit/s |
+| 40 | 2.62 Mbit/s |
+| 48 | 3.15 Mbit/s |
+| 60 | 3.93 Mbit/s |
+
+Raise `target_fps` only when the Devices table stays close to target with zero
+skips and low jitter. Latest-frame semantics are retained: a slow connection
+skips stale frames instead of building latency.
 
 ## Development
 
@@ -171,4 +217,6 @@ can be developed against a laptop before the add-on is installed. Feed scenes
 real data with `--home-state states.json` (a dump of `/api/states`).
 
 Preview output is round-tripped through RGB565, so what you see is what the
-panel shows, quantisation included.
+panel shows, quantisation included. The browser requests native 64×64 PNGs at
+up to 24 FPS and scales them with nearest-neighbour rendering; each request is
+started only after the previous one finishes.

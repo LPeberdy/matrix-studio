@@ -16,7 +16,7 @@ from PIL import Image
 
 from matrix_studio.framebuffer import FrameBus, RenderedFrame, image_to_rgb565
 from matrix_studio.scene_api import Controls
-from matrix_studio.server import DeviceServer
+from matrix_studio.server import DeviceConnection, DeviceServer
 from matrix_studio.vendor import matrix_studio_protocol as proto
 
 HELLO = proto.Hello(1, 64, 64, proto.PixelFormat.RGB565, "test-device", "0.0.1").encode()
@@ -25,6 +25,65 @@ HELLO = proto.Hello(1, 64, 64, proto.PixelFormat.RGB565, "test-device", "0.0.1")
 def make_frame(colour=(255, 0, 0), timestamp_ms: int = 7, scene: str = "test") -> RenderedFrame:
     image = Image.new("RGB", (64, 64), colour)
     return RenderedFrame(pixels=image_to_rgb565(image), timestamp_ms=timestamp_ms, scene=scene, image=image)
+
+
+def test_device_connection_reports_recent_send_cadence_and_jitter():
+    connection = DeviceConnection(id=1, remote="test")
+    for sent_at in (10.000, 10.040, 10.081, 10.120, 10.160):
+        connection.note_frame_sent(sent_at)
+
+    status = connection.as_dict(monotonic_now=10.160)
+
+    assert status["send_fps"] == pytest.approx(25.0, abs=0.1)
+    assert status["send_jitter_ms"] == pytest.approx(0.7, abs=0.1)
+    assert status["max_frame_gap_ms"] == pytest.approx(41.0, abs=0.1)
+    assert status["cadence_stale"] is False
+
+
+def test_device_connection_marks_stalled_cadence_and_reads_live_drops():
+    dropped = 0
+    connection = DeviceConnection(id=1, remote="test")
+    connection.track_drops(lambda: dropped)
+    connection.note_frame_sent(10.000)
+    connection.note_frame_sent(10.040)
+
+    dropped = 7
+    status = connection.as_dict(monotonic_now=11.100)
+
+    assert status["frames_dropped"] == 7
+    assert status["cadence_stale"] is True
+    assert status["send_fps"] is None
+    assert status["send_jitter_ms"] is None
+    assert status["max_frame_gap_ms"] == pytest.approx(1060.0, abs=0.1)
+
+
+async def test_blank_resume_resets_cadence_before_detecting_a_new_stall():
+    class StubWebSocket:
+        closed = False
+
+        async def send_bytes(self, data):
+            pass
+
+    controls = Controls(brightness=200, blank=False)
+    server = DeviceServer(FrameBus(), controls, frame_interval_hint_ms=40)
+    connection = DeviceConnection(id=1, remote="test", expected_frame_interval_s=0.04)
+    connection.sent_brightness = 200
+    connection.sent_blank = False
+    connection.note_frame_sent(10.000)
+    connection.note_frame_sent(10.040)
+
+    controls.blank = True
+    await server._flush_controls(StubWebSocket(), connection)
+    controls.blank = False
+    await server._flush_controls(StubWebSocket(), connection)
+    connection.note_frame_sent(20.000)
+    connection.note_frame_sent(20.040)
+
+    resumed = connection.as_dict(monotonic_now=20.040)
+    stalled_again = connection.as_dict(monotonic_now=21.100)
+    assert resumed["send_fps"] == pytest.approx(25.0, abs=0.1)
+    assert resumed["max_frame_gap_ms"] == pytest.approx(40.0, abs=0.1)
+    assert stalled_again["cadence_stale"] is True
 
 
 class Harness:
@@ -185,6 +244,33 @@ async def test_frames_are_streamed_with_a_per_session_sequence(harness):
             await asyncio.sleep(0.02)
 
         assert sequences == [0, 1, 2], "sequence must start at 0 and increment per frame"
+
+
+async def test_drop_count_stays_live_while_a_frame_send_is_backpressured(harness, monkeypatch):
+    async with harness.connect() as ws:
+        await harness.handshake(ws)
+        await asyncio.sleep(0.05)
+
+        original_send = harness.server._send
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def block_frame_send(socket, data):
+            if proto.decode_header(data).type == proto.MessageType.FRAME:
+                send_started.set()
+                await release_send.wait()
+            await original_send(socket, data)
+
+        monkeypatch.setattr(harness.server, "_send", block_frame_send)
+        harness.bus.publish(make_frame(timestamp_ms=0))
+        await asyncio.wait_for(send_started.wait(), timeout=1)
+
+        for index in range(1, 7):
+            harness.bus.publish(make_frame(timestamp_ms=index))
+
+        assert harness.server.connections()[0]["frames_dropped"] == 5
+        release_send.set()
+        await harness.next_of_type(ws, proto.MessageType.FRAME)
 
 
 async def test_a_reconnecting_device_gets_a_fresh_session(harness):

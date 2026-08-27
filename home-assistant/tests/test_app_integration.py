@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import pathlib
+import threading
+import time
 
 import aiohttp
 import pytest
@@ -116,6 +118,15 @@ async def test_static_assets_are_served(studio, client):
             assert content_type in response.headers["Content-Type"]
 
 
+async def test_preview_uses_native_frames_and_non_overlapping_refreshes(studio, client):
+    async with client.get(f"{base_url(studio)}/static/app.js") as response:
+        javascript = await response.text()
+
+    assert "api/preview.png?scale=1" in javascript
+    assert 'addEventListener("load", schedulePreview)' in javascript
+    assert "setInterval(refreshPreview" not in javascript
+
+
 async def test_preview_endpoint_returns_a_png_of_the_live_frame(studio, client):
     await asyncio.sleep(0.15)
     async with client.get(f"{base_url(studio)}/api/preview.png?scale=4") as response:
@@ -129,6 +140,31 @@ async def test_preview_endpoint_returns_a_png_of_the_live_frame(studio, client):
 
     image = Image.open(io.BytesIO(body))
     assert image.size == (256, 256)
+
+
+async def test_concurrent_preview_requests_share_one_dedicated_encode(studio, client, monkeypatch):
+    from matrix_studio import web as web_module
+
+    await asyncio.sleep(0.1)
+    await studio.engine.stop()  # Pin the latest frame so every request has the same cache key.
+    original = web_module._encode_preview_png
+    calls = []
+
+    def counted_encode(pixels, scale):
+        calls.append(threading.current_thread().name)
+        time.sleep(0.03)
+        return original(pixels, scale)
+
+    monkeypatch.setattr(web_module, "_encode_preview_png", counted_encode)
+    url = f"{base_url(studio)}/api/preview.png?scale=1"
+    responses = await asyncio.gather(*(client.get(url) for _ in range(6)))
+    try:
+        assert all(response.status == 200 for response in responses)
+        assert len(calls) == 1
+        assert calls[0].startswith("matrix-preview")
+    finally:
+        for response in responses:
+            response.release()
 
 
 async def test_ui_controls_change_brightness_scene_and_blank(studio, client):
@@ -206,7 +242,7 @@ async def test_a_device_connects_and_receives_live_frames(studio, client):
         seen_brightness = None
         frames = []
         deadline = asyncio.get_running_loop().time() + 5
-        while len(frames) < 3 and asyncio.get_running_loop().time() < deadline:
+        while len(frames) < 8 and asyncio.get_running_loop().time() < deadline:
             message = await asyncio.wait_for(ws.receive(), timeout=5)
             header = proto.decode_header(message.data)
             payload = message.data[8:]
@@ -215,15 +251,21 @@ async def test_a_device_connects_and_receives_live_frames(studio, client):
             elif header.type == proto.MessageType.BRIGHTNESS:
                 seen_brightness = proto.Brightness.decode_payload(payload).brightness
 
-        assert len(frames) == 3
+        assert len(frames) == 8
         assert seen_brightness == 123, "the configured brightness must be pushed on connect"
-        assert [frame.sequence for frame in frames] == [0, 1, 2]
+        assert [frame.sequence for frame in frames] == list(range(8))
         assert all(len(frame.pixels) == 8192 for frame in frames)
         assert any(frames[0].pixels != frame.pixels for frame in frames[1:]), "scene should be animating"
 
         await asyncio.sleep(0.05)
         assert studio.server.device_count == 1
-        assert studio.status()["devices"][0]["device_id"] == "itest-device"
+        device = studio.status()["devices"][0]
+        assert device["device_id"] == "itest-device"
+        assert device["frames_dropped"] == 0
+        assert device["cadence_stale"] is False
+        assert device["send_fps"] == pytest.approx(40, abs=8)
+        assert device["send_jitter_ms"] < 25
+        assert device["max_frame_gap_ms"] < 80
 
 
 async def test_brightness_change_reaches_a_connected_device(studio, client):

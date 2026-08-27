@@ -90,6 +90,11 @@ To check panel wiring, pick the **testcard** scene: colour bars, per-channel
 ramps, a 1 px border and four distinct corner pixels (red = top-left,
 green = top-right, blue = bottom-left, white = bottom-right).
 
+To check animation cadence, pick **motion_test**. Its cyan bar moves at a
+constant 8 pixels/second. The Devices table reports recent send FPS, timing
+jitter, longest frame gap, and skipped frames; use those readings to separate
+artwork motion from renderer/network cadence.
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -99,6 +104,7 @@ green = top-right, blue = bottom-left, white = bottom-right).
 | Home Assistant state shown as stale | See the add-on log for the API error; rendering continues with the last known values |
 | Scene quarantined | Fix or replace the scene, then press **Reload scenes** |
 | Low FPS | Lower `target_fps`, or simplify the scene; the status panel shows per-frame render time |
+| Motion bunches or jumps | Select **motion_test**, then check device send FPS, jitter, longest gap, and skipped frames |
 | Panel colours wrong / mirrored | Use the **testcard** scene and check the firmware's `board_config.h` |
 
 ## Ports

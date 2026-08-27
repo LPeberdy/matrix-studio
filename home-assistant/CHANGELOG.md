@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4
+
+- Remove plasma's periodic slow/fast beat by moving its interference field at one coherent velocity.
+- Upgrade the untouched 0.1.2/0.1.3 starter plasma while preserving customized user scenes.
+- Add a constant-speed `motion_test` scene for diagnosing end-to-end cadence.
+- Show recent device send FPS, jitter, longest gap, and live skipped-frame counts.
+- Raise the ingress preview to 24 FPS with native 64x64 images, serialized browser requests, and coalesced dedicated encoding.
+
 ## 0.1.3
 
 - Add a Matrix Studio scene installation API for Home Assistant MCP and other ingress clients.

@@ -18,13 +18,15 @@ Operational rules this module implements:
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import contextlib
 import itertools
 import logging
 import random
+import statistics
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from aiohttp import WSMsgType, web
 
@@ -57,6 +59,7 @@ class DeviceConnection:
 
     id: int
     remote: str
+    expected_frame_interval_s: float = 0.04
     device_id: str = ""
     fw_version: str = ""
     width: int = 0
@@ -79,9 +82,40 @@ class DeviceConnection:
     ota_image: bytes | None = field(default=None, repr=False)
     ota_done: asyncio.Future[None] | None = field(default=None, repr=False)
     ota_status: asyncio.Queue[protocol.Status] = field(default_factory=asyncio.Queue, repr=False)
+    _last_send_at: float | None = field(default=None, repr=False)
+    _send_intervals: deque[float] = field(default_factory=lambda: deque(maxlen=120), repr=False)
+    _drop_counter: Callable[[], int] | None = field(default=None, repr=False)
 
-    def as_dict(self) -> dict[str, Any]:
+    def note_frame_sent(self, sent_at: float) -> None:
+        """Record send completion time for a bounded, recent cadence window."""
+        if self._last_send_at is not None:
+            self._send_intervals.append(sent_at - self._last_send_at)
+        self._last_send_at = sent_at
+
+    def track_drops(self, counter: Callable[[], int]) -> None:
+        """Read the subscription's live drop count even while a send blocks."""
+        self._drop_counter = counter
+
+    def reset_cadence(self) -> None:
+        """Start a fresh measurement window after an intentional stream pause."""
+        self._last_send_at = None
+        self._send_intervals.clear()
+
+    def as_dict(self, *, monotonic_now: float | None = None) -> dict[str, Any]:
         now = time.time()
+        monotonic_now = time.monotonic() if monotonic_now is None else monotonic_now
+        intervals = tuple(self._send_intervals)
+        interval_total = sum(intervals)
+        unfinished_gap = monotonic_now - self._last_send_at if self._last_send_at is not None else None
+        stale_after = max(1.0, self.expected_frame_interval_s * 3.0)
+        cadence_stale = unfinished_gap is not None and unfinished_gap > stale_after
+        send_fps = len(intervals) / interval_total if intervals and interval_total > 0 and not cadence_stale else None
+        send_jitter_ms = (
+            statistics.pstdev(intervals) * 1000.0 if len(intervals) >= 2 and not cadence_stale else None
+        )
+        observed_gaps = intervals + ((unfinished_gap,) if unfinished_gap is not None else ())
+        max_frame_gap_ms = max(observed_gaps) * 1000.0 if observed_gaps else None
+        frames_dropped = self._drop_counter() if self._drop_counter is not None else self.frames_dropped
         return {
             "id": self.id,
             "remote": self.remote,
@@ -90,7 +124,7 @@ class DeviceConnection:
             "resolution": f"{self.width}x{self.height}",
             "connected_seconds": round(now - self.connected_at, 1),
             "frames_sent": self.frames_sent,
-            "frames_dropped": self.frames_dropped,
+            "frames_dropped": frames_dropped,
             "sequence": self.sequence,
             "last_frame_age": round(now - self.last_frame_at, 2) if self.last_frame_at else None,
             "rtt_ms": round(self.last_rtt_ms, 1) if self.last_rtt_ms is not None else None,
@@ -100,6 +134,10 @@ class DeviceConnection:
                 "total_bytes": self.ota_total_bytes,
                 "last_error": self.ota_last_error,
             },
+            "send_fps": round(send_fps, 1) if send_fps is not None else None,
+            "send_jitter_ms": round(send_jitter_ms, 1) if send_jitter_ms is not None else None,
+            "max_frame_gap_ms": round(max_frame_gap_ms, 1) if max_frame_gap_ms is not None else None,
+            "cadence_stale": cadence_stale,
         }
 
 
@@ -236,7 +274,11 @@ class DeviceServer:
         ws = web.WebSocketResponse(max_msg_size=protocol.HEADER_SIZE_BYTES + protocol.MAX_PAYLOAD_BYTES + 1024)
         await ws.prepare(request)
         remote = request.remote or "?"
-        connection = DeviceConnection(id=next(self._ids), remote=remote)
+        connection = DeviceConnection(
+            id=next(self._ids),
+            remote=remote,
+            expected_frame_interval_s=self.frame_interval_hint_ms / 1000.0,
+        )
         _LOGGER.info("device connected from %s (connection %d)", remote, connection.id)
 
         try:
@@ -508,6 +550,7 @@ class DeviceServer:
 
     async def _writer(self, ws: web.WebSocketResponse, connection: DeviceConnection) -> None:
         with self.bus.subscribe() as subscription:
+            connection.track_drops(lambda: subscription.dropped)
             # Bring the freshly connected device in line with current controls.
             await self._flush_controls(ws, connection)
             while not ws.closed:
@@ -558,6 +601,7 @@ class DeviceServer:
                 connection.frames_sent += 1
                 connection.frames_dropped = subscription.dropped
                 connection.last_frame_at = time.time()
+                connection.note_frame_sent(time.monotonic())
 
     async def _perform_ota(self, ws: web.WebSocketResponse, connection: DeviceConnection) -> None:
         image = connection.ota_image
@@ -633,6 +677,7 @@ class DeviceServer:
         if connection.sent_blank != blank:
             await self._send(ws, protocol.Blank(blank).encode())
             connection.sent_blank = blank
+            connection.reset_cadence()
 
     async def _heartbeat(self, ws: web.WebSocketResponse, connection: DeviceConnection) -> bool:
         """Send a PING while idle; close if the previous one was never answered."""

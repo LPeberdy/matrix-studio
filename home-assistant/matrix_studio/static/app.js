@@ -2,7 +2,8 @@
 // All URLs are relative so the page works under Home Assistant's ingress
 // prefix (set via <base href> by web.py) and standalone.
 
-const PREVIEW_FPS = 8;
+const PREVIEW_FPS = 24;
+const PREVIEW_INTERVAL_MS = 1000 / PREVIEW_FPS;
 const STATUS_INTERVAL_MS = 1000;
 
 const el = (id) => document.getElementById(id);
@@ -10,6 +11,8 @@ let sceneOptionsKey = "";
 let otaDevicesKey = "";
 let brightnessPending = false;
 let otaRequestInFlight = false;
+let previewRequestedAt = 0;
+let previewTimer = null;
 
 async function post(path, body) {
   const response = await fetch(path, {
@@ -25,7 +28,16 @@ async function post(path, body) {
 
 function refreshPreview() {
   // Cache-buster: the endpoint is no-store, but proxies in between may not be.
-  el("preview").src = `api/preview.png?scale=4&t=${Date.now()}`;
+  previewRequestedAt = performance.now();
+  el("preview").src = `api/preview.png?scale=1&t=${Date.now()}`;
+}
+
+function schedulePreview() {
+  // A load/error event ends the current request. Base the delay on when it
+  // began so fast responses maintain 24 FPS while slow ones never overlap.
+  const remaining = Math.max(0, PREVIEW_INTERVAL_MS - (performance.now() - previewRequestedAt));
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(refreshPreview, remaining);
 }
 
 function renderScenes(status) {
@@ -75,7 +87,7 @@ function renderAlerts(status) {
 function renderDevices(status) {
   const body = el("devices").querySelector("tbody");
   if (!status.devices.length) {
-    body.innerHTML = '<tr><td colspan="5" class="muted">no devices connected</td></tr>';
+    body.innerHTML = '<tr><td colspan="6" class="muted">no devices connected</td></tr>';
     return;
   }
   body.innerHTML = status.devices
@@ -83,7 +95,16 @@ function renderDevices(status) {
       (device) => `<tr>
         <td>${device.device_id || "?"}<br><span class="muted">${device.fw_version || ""} ${device.resolution}</span></td>
         <td>${device.remote}</td>
-        <td>${device.frames_sent}</td>
+        <td>${device.frames_sent}<br><span class="muted">${device.frames_dropped} skipped</span></td>
+        <td>${status.controls.blank ? "paused" : device.cadence_stale ? "stalled" : device.send_fps === null ? "-" : device.send_fps + " fps"}<br><span class="muted">${
+          status.controls.blank
+            ? "stream paused"
+            : device.cadence_stale
+            ? `${device.last_frame_age} s since frame · ${device.max_frame_gap_ms} ms gap`
+            : device.send_jitter_ms === null
+              ? "warming up"
+              : `±${device.send_jitter_ms} ms · ${device.max_frame_gap_ms} ms max`
+        }</span></td>
         <td>${device.rtt_ms === null ? "-" : device.rtt_ms + " ms"}</td>
         <td>${Math.round(device.connected_seconds)}s</td>
       </tr>`
@@ -227,7 +248,9 @@ el("ota-install").addEventListener("click", async () => {
   }
 });
 
+el("preview").addEventListener("load", schedulePreview);
+el("preview").addEventListener("error", schedulePreview);
+
 refreshStatus();
 refreshPreview();
 setInterval(refreshStatus, STATUS_INTERVAL_MS);
-setInterval(refreshPreview, Math.round(1000 / PREVIEW_FPS));
