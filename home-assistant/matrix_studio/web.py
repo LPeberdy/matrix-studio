@@ -14,6 +14,8 @@ already-computed state and pokes `Controls`.
 """
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import io
 import logging
 import pathlib
@@ -36,6 +38,16 @@ MAX_SCENE_SOURCE_BYTES = 128 * 1024
 _SCENE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
+def _encode_preview_png(pixels: bytes, scale: int) -> bytes:
+    """Encode outside the event loop so preview work cannot stall frame sends."""
+    image = rgb565_to_image(pixels)
+    if scale > 1:
+        image = image.resize((image.width * scale, image.height * scale), resample=0)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 class IngressWeb:
     """The ingress/preview aiohttp application."""
 
@@ -44,6 +56,11 @@ class IngressWeb:
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
         self._port: int | None = None
+        self._preview_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="matrix-preview")
+        self._preview_lock = asyncio.Lock()
+        self._preview_cache_frame: object | None = None
+        self._preview_cache_scale: int | None = None
+        self._preview_cache_body: bytes | None = None
 
     # ------------------------------------------------------------------- setup
 
@@ -83,6 +100,7 @@ class IngressWeb:
             await self._runner.cleanup()
             self._runner = None
             self._site = None
+        self._preview_executor.shutdown(wait=True, cancel_futures=True)
 
     @property
     def port(self) -> int | None:
@@ -106,20 +124,28 @@ class IngressWeb:
             scale = 4
         scale = max(1, min(MAX_PREVIEW_SCALE, scale))
 
-        frame = self.studio.engine.latest_frame()
-        if frame is None:
-            image = rgb565_to_image(self.studio.engine.black_frame_pixels())
-        else:
-            # Round-trip through RGB565 so the preview shows what the panel
-            # will actually display, quantisation included.
-            image = rgb565_to_image(frame.pixels)
-        if scale > 1:
-            image = image.resize((image.width * scale, image.height * scale), resample=0)
-
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
+        # Coalesce all clients around one encode at a time. This both reuses a
+        # frame for concurrent tabs and prevents preview requests from queuing
+        # jobs in the renderer's default executor.
+        async with self._preview_lock:
+            frame = self.studio.engine.latest_frame()
+            if (
+                self._preview_cache_body is not None
+                and self._preview_cache_frame is frame
+                and self._preview_cache_scale == scale
+            ):
+                body = self._preview_cache_body
+            else:
+                # RGB565 bytes are immutable, so the dedicated worker can
+                # safely encode this snapshot while the engine moves on.
+                pixels = self.studio.engine.black_frame_pixels() if frame is None else frame.pixels
+                loop = asyncio.get_running_loop()
+                body = await loop.run_in_executor(self._preview_executor, _encode_preview_png, pixels, scale)
+                self._preview_cache_frame = frame
+                self._preview_cache_scale = scale
+                self._preview_cache_body = body
         return web.Response(
-            body=buffer.getvalue(),
+            body=body,
             content_type="image/png",
             headers={"Cache-Control": "no-store, max-age=0"},
         )

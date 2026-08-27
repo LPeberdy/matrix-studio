@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import textwrap
 
+import numpy as np
 import pytest
 from PIL import Image
 
@@ -11,7 +12,7 @@ from matrix_studio.engine import MAX_CONSECUTIVE_FAILURES, SceneEngine
 from matrix_studio.loader import SceneRegistry
 from matrix_studio.scene_api import PANEL_HEIGHT, PANEL_WIDTH, Controls, HomeState
 
-BUILTIN_SCENES = {"plasma", "starfield", "landscape", "home_pulse", "testcard"}
+BUILTIN_SCENES = {"plasma", "starfield", "landscape", "home_pulse", "testcard", "motion_test"}
 
 
 def write_scene(directory, name: str, body: str) -> None:
@@ -54,6 +55,32 @@ def test_builtin_scenes_are_stable_across_many_frames(home_state):
         for step in range(60):
             image = scene.render(step * 0.04, home_state, controls)
             assert image.size == (64, 64)
+
+
+def test_plasma_moves_as_one_field_at_a_constant_velocity(home_state):
+    """One second of plasma motion is a rigid 6px/3px translation, not a beat."""
+    registry = SceneRegistry(None)
+    registry.load()
+    scene = registry.get("plasma").scene
+    controls = Controls(active_scene="plasma")
+
+    start = np.asarray(scene.render(0.0, home_state, controls), dtype=np.int16)
+    after_one_second = np.asarray(scene.render(1.0, home_state, controls), dtype=np.int16)
+    expected = np.roll(start, shift=(3, 6), axis=(0, 1))
+
+    assert np.abs(after_one_second - expected).max() <= 1
+
+
+def test_motion_test_is_a_constant_velocity_reference(home_state):
+    registry = SceneRegistry(None)
+    registry.load()
+    scene = registry.get("motion_test").scene
+    controls = Controls(active_scene="motion_test")
+
+    start = np.asarray(scene.render(2.0, home_state, controls))
+    half_second_later = np.asarray(scene.render(2.5, home_state, controls))
+
+    assert np.array_equal(half_second_later, np.roll(start, shift=4, axis=1))
 
 
 # ------------------------------------------------------------- user scenes

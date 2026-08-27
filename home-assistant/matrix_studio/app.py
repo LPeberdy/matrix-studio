@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import pathlib
 import shutil
@@ -28,8 +29,30 @@ from .web import IngressWeb
 _LOGGER = logging.getLogger(__name__)
 
 #: Bundled user-scene examples. Missing files are copied into the configured
-#: scenes directory on startup; existing user files are never overwritten.
+#: scenes directory on startup. Existing files are preserved unless their
+#: digest exactly matches a known, superseded starter scene.
 EXAMPLE_SCENES_DIR = pathlib.Path(__file__).resolve().parents[1] / "example_scenes"
+
+_SUPERSEDED_EXAMPLE_HASHES: dict[str, frozenset[str]] = {
+    "plasma.py": frozenset(
+        {
+            # Matrix Studio 0.1.2-0.1.3 starter scene. Replacing this exact
+            # file fixes its uneven motion without touching user edits.
+            "8190b750927936991d399b5ecd97ad7612b73326597d8e4b12f648d52b3e7b30",
+        }
+    ),
+}
+
+
+def _copy_example_atomically(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Copy a bundled example without exposing a partially written scene."""
+    temporary = destination.with_name(f".{destination.name}.seed.tmp")
+    try:
+        shutil.copy2(source, temporary)
+        temporary.replace(destination)
+    finally:
+        with contextlib.suppress(OSError):
+            temporary.unlink(missing_ok=True)
 
 
 def configure_logging(level: int) -> None:
@@ -150,24 +173,39 @@ class MatrixStudioApp:
     # ---------------------------------------------------------------- lifecycle
 
     def ensure_scenes_dir(self) -> None:
-        """Create the user scene directory and add any missing bundled examples."""
+        """Seed examples and safely upgrade unmodified superseded starters."""
         try:
             directory = pathlib.Path(self.options.scenes_dir)
             directory.mkdir(parents=True, exist_ok=True)
 
             copied: list[str] = []
+            upgraded: list[str] = []
             if EXAMPLE_SCENES_DIR.is_dir():
                 for source in EXAMPLE_SCENES_DIR.iterdir():
                     if not source.is_file():
                         continue
                     destination = directory / source.name
                     if destination.exists():
+                        known_hashes = _SUPERSEDED_EXAMPLE_HASHES.get(source.name, ())
+                        if known_hashes and destination.is_file():
+                            digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+                            if digest in known_hashes:
+                                _copy_example_atomically(source, destination)
+                                upgraded.append(source.name)
                         continue
-                    shutil.copy2(source, destination)
+                    _copy_example_atomically(source, destination)
                     copied.append(source.name)
 
             if copied:
                 _LOGGER.info("added %d missing example file(s) to %s: %s", len(copied), directory, ", ".join(copied))
+            if upgraded:
+                _LOGGER.info(
+                    "upgraded %d unmodified example file(s) in %s: %s",
+                    len(upgraded),
+                    directory,
+                    ", ".join(upgraded),
+                )
+            if copied or upgraded:
                 self.registry.load()
         except OSError as exc:
             _LOGGER.warning("could not prepare scenes directory %s: %s", self.options.scenes_dir, exc)
