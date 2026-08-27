@@ -1,7 +1,7 @@
 # Home Assistant Supervisor add-on manifest.
 # Reference: https://developers.home-assistant.io/docs/add-ons/configuration
 name: Matrix Studio
-version: "0.1.5"
+version: "0.1.6"
 slug: matrix_studio
 description: >-
   Streams generative-art frames from Home Assistant to an ESP32-S3 HUB75 LED

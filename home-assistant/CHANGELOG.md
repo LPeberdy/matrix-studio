@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.6
+
+- Close the completed OTA WebSocket proactively so a reboot cannot leave a stale device session alongside the reconnected panel.
+
 ## 0.1.5
 
 - Synchronise ingress preview requests to actual engine frames instead of an independent 24 FPS browser timer.

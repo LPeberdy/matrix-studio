@@ -27,6 +27,6 @@ LABEL \
   io.hass.name="Matrix Studio" \
   io.hass.description="Generative-art frame server for ESP32-S3 HUB75 LED matrices" \
   io.hass.type="addon" \
-  io.hass.version="0.1.5"
+  io.hass.version="0.1.6"
 
 CMD ["/app/run.sh"]

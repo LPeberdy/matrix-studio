@@ -8,4 +8,4 @@ Entry points:
     python -m matrix_studio.preview     render/preview scenes with no hardware
 """
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
