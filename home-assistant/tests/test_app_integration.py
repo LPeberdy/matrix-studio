@@ -7,6 +7,7 @@ ingress UI and a real ESP32 would.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import pathlib
 import threading
@@ -118,12 +119,13 @@ async def test_static_assets_are_served(studio, client):
             assert content_type in response.headers["Content-Type"]
 
 
-async def test_preview_uses_native_frames_and_non_overlapping_refreshes(studio, client):
+async def test_preview_follows_engine_frames_instead_of_an_independent_timer(studio, client):
     async with client.get(f"{base_url(studio)}/static/app.js") as response:
         javascript = await response.text()
 
-    assert "api/preview.png?scale=1" in javascript
-    assert 'addEventListener("load", schedulePreview)' in javascript
+    assert "fetch(`api/preview.png?scale=1&after=${previewFrame}`" in javascript
+    assert 'response.headers.get("X-Matrix-Frame")' in javascript
+    assert "PREVIEW_FPS" not in javascript
     assert "setInterval(refreshPreview" not in javascript
 
 
@@ -140,6 +142,52 @@ async def test_preview_endpoint_returns_a_png_of_the_live_frame(studio, client):
 
     image = Image.open(io.BytesIO(body))
     assert image.size == (256, 256)
+
+
+async def test_preview_long_poll_waits_for_the_next_engine_frame(studio, client):
+    await studio.engine.stop()
+    current = await studio.engine.tick()
+    assert current is not None
+
+    request = asyncio.create_task(
+        client.get(f"{base_url(studio)}/api/preview.png?scale=1&after={current.timestamp_ms}")
+    )
+    await asyncio.sleep(0.03)
+    assert not request.done()
+
+    following = await studio.engine.tick()
+    assert following is not None
+    response = await asyncio.wait_for(request, timeout=0.5)
+    try:
+        assert response.status == 200
+        assert response.headers["X-Matrix-Frame"] == str(following.timestamp_ms)
+    finally:
+        response.release()
+
+
+async def test_blanking_wakes_a_preview_long_poll_and_returns_black(studio, client):
+    from PIL import Image
+    import io
+
+    await studio.engine.stop()
+    current = await studio.engine.tick()
+    assert current is not None
+
+    request = asyncio.create_task(
+        client.get(f"{base_url(studio)}/api/preview.png?scale=1&after={current.timestamp_ms}")
+    )
+    await asyncio.sleep(0.03)
+    assert not request.done()
+
+    studio.set_blank(True)
+    response = await asyncio.wait_for(request, timeout=0.5)
+    try:
+        assert response.status == 200
+        assert response.headers["X-Matrix-Frame"] == "blank"
+        image = Image.open(io.BytesIO(await response.read()))
+        assert image.getbbox() is None
+    finally:
+        response.release()
 
 
 async def test_concurrent_preview_requests_share_one_dedicated_encode(studio, client, monkeypatch):
@@ -165,6 +213,101 @@ async def test_concurrent_preview_requests_share_one_dedicated_encode(studio, cl
     finally:
         for response in responses:
             response.release()
+
+
+async def test_agent_can_stage_firmware_in_bounded_json_chunks(studio, client, monkeypatch):
+    image = b"\xe9" + bytes(range(256)) * 300
+    first, second = image[:40000], image[40000:]
+
+    async with client.post(
+        f"{base_url(studio)}/api/ota/stage",
+        json={"offset": 0, "data": base64.b64encode(first).decode("ascii")},
+    ) as response:
+        assert response.status == 200
+        staged = await response.json()
+
+    upload_id = staged["upload_id"]
+    assert staged["bytes"] == len(first)
+    async with client.post(
+        f"{base_url(studio)}/api/ota/stage",
+        json={
+            "upload_id": upload_id,
+            "offset": len(first),
+            "data": base64.b64encode(second).decode("ascii"),
+        },
+    ) as response:
+        assert response.status == 200
+        assert (await response.json())["bytes"] == len(image)
+
+    installed = []
+
+    async def capture_ota(connection_id, firmware):
+        installed.append((connection_id, firmware))
+
+    monkeypatch.setattr(studio.server, "ota_update", capture_ota)
+    async with client.post(
+        f"{base_url(studio)}/api/ota/commit",
+        json={"upload_id": upload_id, "connection_id": 7},
+    ) as response:
+        assert response.status == 200
+        assert (await response.json())["bytes"] == len(image)
+    assert installed == [(7, image)]
+
+
+async def test_staged_firmware_rejects_wrong_offsets_and_invalid_base64(studio, client):
+    async with client.post(
+        f"{base_url(studio)}/api/ota/stage",
+        json={"offset": 0, "data": base64.b64encode(b"\xe9first").decode("ascii")},
+    ) as response:
+        upload_id = (await response.json())["upload_id"]
+
+    for body in (
+        {"upload_id": upload_id, "offset": 99, "data": "YQ=="},
+        {"upload_id": upload_id, "offset": 6, "data": "not base64"},
+        {"upload_id": upload_id, "offset": "6", "data": "YQ=="},
+        {"upload_id": upload_id, "offset": True, "data": "YQ=="},
+    ):
+        async with client.post(f"{base_url(studio)}/api/ota/stage", json=body) as response:
+            assert response.status == 400
+
+
+async def test_staged_firmware_requires_explicit_reset_and_survives_failed_commit(studio, client, monkeypatch):
+    from matrix_studio.server import OtaUpdateError
+
+    encoded = base64.b64encode(b"\xe9firmware").decode("ascii")
+    async with client.post(
+        f"{base_url(studio)}/api/ota/stage", json={"offset": 0, "data": encoded}
+    ) as response:
+        first_id = (await response.json())["upload_id"]
+
+    async with client.post(
+        f"{base_url(studio)}/api/ota/stage", json={"offset": 0, "reset": "false", "data": encoded}
+    ) as response:
+        assert response.status == 409
+    async with client.post(
+        f"{base_url(studio)}/api/ota/stage", json={"offset": 0, "reset": True, "data": encoded}
+    ) as response:
+        assert response.status == 200
+        upload_id = (await response.json())["upload_id"]
+    assert upload_id != first_id
+
+    attempts = 0
+
+    async def flaky_ota(connection_id, firmware):
+        nonlocal attempts
+        attempts += 1
+        assert connection_id == 7
+        assert firmware == b"\xe9firmware"
+        if attempts == 1:
+            raise OtaUpdateError("temporary disconnect")
+
+    monkeypatch.setattr(studio.server, "ota_update", flaky_ota)
+    commit = {"upload_id": upload_id, "connection_id": 7}
+    async with client.post(f"{base_url(studio)}/api/ota/commit", json=commit) as response:
+        assert response.status == 409
+    async with client.post(f"{base_url(studio)}/api/ota/commit", json=commit) as response:
+        assert response.status == 200
+    assert attempts == 2
 
 
 async def test_ui_controls_change_brightness_scene_and_blank(studio, client):

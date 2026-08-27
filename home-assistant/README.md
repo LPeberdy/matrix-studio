@@ -133,6 +133,13 @@ The upload endpoint accepts only an ESP-IDF application image up to the 3 MiB
 OTA-slot size. Bootloader and partition-table changes remain recovery/USB work,
 not routine OTA updates.
 
+Authenticated JSON-only clients can use `POST /api/ota/stage` with base64
+`data`, a sequential byte `offset`, and the returned `upload_id`. An initial
+`offset: 0` starts an upload; `reset: true` explicitly replaces a staged one.
+Finish with `POST /api/ota/commit` carrying that `upload_id` and the live
+device `connection_id`. Staged images are bounded to the OTA partition, expire
+after 15 minutes, and remain available when a commit fails so it can be retried.
+
 ## Writing scenes
 
 A scene is anything with `render(t, home, controls) -> PIL.Image.Image`
@@ -217,6 +224,8 @@ can be developed against a laptop before the add-on is installed. Feed scenes
 real data with `--home-state states.json` (a dump of `/api/states`).
 
 Preview output is round-tripped through RGB565, so what you see is what the
-panel shows, quantisation included. The browser requests native 64×64 PNGs at
-up to 24 FPS and scales them with nearest-neighbour rendering; each request is
-started only after the previous one finishes.
+panel shows, quantisation included. The browser long-polls native 64×64 PNGs
+on the engine's actual frame boundary and scales them with nearest-neighbour
+rendering. This avoids an independent preview timer drifting in and out of
+phase with the renderer, and each request starts only after the previous frame
+has decoded.

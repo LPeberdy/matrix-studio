@@ -15,11 +15,15 @@ already-computed state and pokes `Controls`.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 from concurrent.futures import ThreadPoolExecutor
 import io
 import logging
 import pathlib
 import re
+import secrets
+import time
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -36,6 +40,7 @@ STATIC_DIR = pathlib.Path(__file__).parent / "static"
 MAX_PREVIEW_SCALE = 8
 MAX_SCENE_SOURCE_BYTES = 128 * 1024
 _SCENE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_OTA_UPLOAD_TTL_SECONDS = 15 * 60
 
 
 def _encode_preview_png(pixels: bytes, scale: int) -> bytes:
@@ -61,6 +66,11 @@ class IngressWeb:
         self._preview_cache_frame: object | None = None
         self._preview_cache_scale: int | None = None
         self._preview_cache_body: bytes | None = None
+        self._ota_upload_id: str | None = None
+        self._ota_upload = bytearray()
+        self._ota_upload_started_at = 0.0
+        self._ota_upload_committing = False
+        self._ota_expiry_handle: asyncio.TimerHandle | None = None
 
     # ------------------------------------------------------------------- setup
 
@@ -79,6 +89,8 @@ class IngressWeb:
         app.router.add_post("/api/blank", self.set_blank)
         app.router.add_post("/api/reload", self.reload_scenes)
         app.router.add_post("/api/ota", self.ota_update)
+        app.router.add_post("/api/ota/stage", self.ota_stage)
+        app.router.add_post("/api/ota/commit", self.ota_commit)
         app.router.add_static("/static/", STATIC_DIR, name="static")
         return app
 
@@ -100,6 +112,7 @@ class IngressWeb:
             await self._runner.cleanup()
             self._runner = None
             self._site = None
+        self._clear_ota_upload()
         self._preview_executor.shutdown(wait=True, cancel_futures=True)
 
     @property
@@ -124,11 +137,27 @@ class IngressWeb:
             scale = 4
         scale = max(1, min(MAX_PREVIEW_SCALE, scale))
 
+        try:
+            after = int(request.query["after"])
+        except (KeyError, TypeError, ValueError):
+            after = None
+
+        # Long-poll the engine's actual frame boundary instead of making the
+        # browser run an unrelated timer. Two free-running clocks periodically
+        # phase past one another and manifest as the reported move/freeze beat.
+        frame = self.studio.engine.latest_frame()
+        if after is not None and not self.studio.controls.blank:
+            frame = await self.studio.engine.bus.next_after(after)
+        # Use one state snapshot for both pixels and response marker. A control
+        # transition after this point wakes the next long-poll request.
+        blank = self.studio.controls.blank
+        if blank:
+            frame = None
+
         # Coalesce all clients around one encode at a time. This both reuses a
         # frame for concurrent tabs and prevents preview requests from queuing
         # jobs in the renderer's default executor.
         async with self._preview_lock:
-            frame = self.studio.engine.latest_frame()
             if (
                 self._preview_cache_body is not None
                 and self._preview_cache_frame is frame
@@ -144,10 +173,11 @@ class IngressWeb:
                 self._preview_cache_frame = frame
                 self._preview_cache_scale = scale
                 self._preview_cache_body = body
+        marker = "blank" if blank or frame is None else str(frame.timestamp_ms)
         return web.Response(
             body=body,
             content_type="image/png",
-            headers={"Cache-Control": "no-store, max-age=0"},
+            headers={"Cache-Control": "no-store, max-age=0", "X-Matrix-Frame": marker},
         )
 
     async def set_scene(self, request: web.Request) -> web.Response:
@@ -283,6 +313,111 @@ class IngressWeb:
                 "message": "firmware committed; device rebooting",
             }
         )
+
+    async def ota_stage(self, request: web.Request) -> web.Response:
+        """Stage one bounded base64 chunk for clients that cannot send files.
+
+        Home Assistant's ingress UI continues to use the raw `/api/ota`
+        upload. This companion path gives API clients a JSON-only transport
+        without ever placing an entire firmware image in one request.
+        """
+        self._expire_ota_upload()
+        body = await self._json(request)
+        offset = body.get("offset")
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            return web.json_response({"ok": False, "error": "offset must be an integer"}, status=400)
+        try:
+            chunk = base64.b64decode(str(body.get("data", "")), validate=True)
+        except (binascii.Error, ValueError):
+            return web.json_response({"ok": False, "error": "data must be valid base64"}, status=400)
+        if not chunk:
+            return web.json_response({"ok": False, "error": "firmware chunk is empty"}, status=400)
+
+        if self._ota_upload_committing:
+            return web.json_response({"ok": False, "error": "firmware upload is being committed"}, status=409)
+        if offset == 0:
+            if self._ota_upload_id is not None and body.get("reset") is not True:
+                return web.json_response(
+                    {"ok": False, "error": "firmware upload already staged; pass reset=true to replace it"},
+                    status=409,
+                )
+            self._clear_ota_upload()
+            self._ota_upload_id = secrets.token_hex(12)
+            self._ota_upload_started_at = time.monotonic()
+            self._schedule_ota_expiry()
+        elif body.get("upload_id") != self._ota_upload_id or self._ota_upload_id is None:
+            return web.json_response({"ok": False, "error": "unknown firmware upload"}, status=400)
+        if offset != len(self._ota_upload):
+            return web.json_response(
+                {"ok": False, "error": f"expected offset {len(self._ota_upload)}, got {offset}"}, status=400
+            )
+        if len(self._ota_upload) + len(chunk) > MAX_OTA_IMAGE_BYTES:
+            return web.json_response({"ok": False, "error": "firmware image exceeds OTA partition"}, status=413)
+
+        self._ota_upload.extend(chunk)
+        return web.json_response({"ok": True, "upload_id": self._ota_upload_id, "bytes": len(self._ota_upload)})
+
+    async def ota_commit(self, request: web.Request) -> web.Response:
+        self._expire_ota_upload()
+        body = await self._json(request)
+        if body.get("upload_id") != self._ota_upload_id or self._ota_upload_id is None:
+            return web.json_response({"ok": False, "error": "unknown firmware upload"}, status=400)
+        try:
+            connection_id = int(body.get("connection_id"))
+        except (TypeError, ValueError):
+            return web.json_response({"ok": False, "error": "connection_id must be an integer"}, status=400)
+
+        if self._ota_upload_committing:
+            return web.json_response({"ok": False, "error": "firmware upload is already being committed"}, status=409)
+
+        image = bytes(self._ota_upload)
+        upload_id = self._ota_upload_id
+        self._ota_upload_committing = True
+        try:
+            await self.studio.server.ota_update(connection_id, image)
+        except OtaUpdateError as exc:
+            # Retain the staged bytes so a transient disconnect or validation
+            # failure can be retried without transferring the whole image again.
+            self._ota_upload_started_at = time.monotonic()
+            self._schedule_ota_expiry()
+            return web.json_response({"ok": False, "error": str(exc)}, status=409)
+        finally:
+            self._ota_upload_committing = False
+        if self._ota_upload_id == upload_id:
+            self._clear_ota_upload()
+        return web.json_response(
+            {
+                "ok": True,
+                "connection_id": connection_id,
+                "bytes": len(image),
+                "message": "firmware committed; device rebooting",
+            }
+        )
+
+    def _expire_ota_upload(self) -> None:
+        self._ota_expiry_handle = None
+        if self._ota_upload_id is None or self._ota_upload_committing:
+            return
+        remaining = _OTA_UPLOAD_TTL_SECONDS - (time.monotonic() - self._ota_upload_started_at)
+        if remaining <= 0:
+            self._clear_ota_upload()
+        else:
+            self._ota_expiry_handle = asyncio.get_running_loop().call_later(remaining, self._expire_ota_upload)
+
+    def _schedule_ota_expiry(self) -> None:
+        if self._ota_expiry_handle is not None:
+            self._ota_expiry_handle.cancel()
+        self._ota_expiry_handle = asyncio.get_running_loop().call_later(
+            _OTA_UPLOAD_TTL_SECONDS, self._expire_ota_upload
+        )
+
+    def _clear_ota_upload(self) -> None:
+        if self._ota_expiry_handle is not None:
+            self._ota_expiry_handle.cancel()
+            self._ota_expiry_handle = None
+        self._ota_upload_id = None
+        self._ota_upload.clear()
+        self._ota_upload_started_at = 0.0
 
     @staticmethod
     async def _json(request: web.Request) -> dict[str, Any]:

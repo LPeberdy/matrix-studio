@@ -122,9 +122,12 @@ extern "C" void app_main(void) {
   }
 
   // An OTA image is accepted only if every core local subsystem initialized,
-  // including HUB75. Network association itself may legitimately fail because
-  // of local configuration, so it is not part of rollback validation.
-  matrix_studio::ota::finish_boot_validation(display_ok);
+  // including HUB75, and the image has usable network configuration. Actual
+  // association is deliberately excluded: a router outage must not roll back
+  // healthy firmware. The configuration check prevents a secret-free release
+  // image with erased NVS from stranding a panel that could roll back to an
+  // older image containing build-time credentials.
+  matrix_studio::ota::finish_boot_validation(display_ok && matrix_studio::wifi::has_network_config());
 
   ESP_LOGI(TAG, "startup complete; render core %d, network core %d", matrix_studio::config::kRenderCore,
            matrix_studio::config::kNetworkCore);

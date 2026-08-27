@@ -27,13 +27,18 @@ char g_ip[16] = "0.0.0.0";
 char g_device_id[17] = {};
 int g_retries = 0;
 bool g_started = false;
+bool g_using_stored_credentials = false;
 
 void on_wifi_event(void*, esp_event_base_t base, int32_t id, void* data) {
   if (base != WIFI_EVENT) return;
 
   switch (id) {
     case WIFI_EVENT_STA_START:
-      ESP_LOGI(TAG, "station started, connecting to \"%s\"", config::kWifiSsid);
+      if (g_using_stored_credentials) {
+        ESP_LOGI(TAG, "station started, connecting with stored Wi-Fi credentials");
+      } else {
+        ESP_LOGI(TAG, "station started, connecting to \"%s\"", config::kWifiSsid);
+      }
       esp_wifi_connect();
       break;
 
@@ -113,20 +118,27 @@ esp_err_t start() {
   compute_device_id();
   ESP_LOGI(TAG, "device id %s", g_device_id);
 
-  if (config::kWifiSsid[0] == '\0') {
-    ESP_LOGE(TAG, "no Wi-Fi SSID configured. Set it with `idf.py menuconfig` under "
-                  "\"Matrix Studio\" -> Wi-Fi, or copy main/wifi_secrets.h.example to "
-                  "main/wifi_secrets.h. The panel will keep running diagnostics but cannot connect.");
-  }
-
   wifi_config_t sta_cfg = {};
-  std::strncpy(reinterpret_cast<char*>(sta_cfg.sta.ssid), config::kWifiSsid, sizeof(sta_cfg.sta.ssid) - 1);
-  std::strncpy(reinterpret_cast<char*>(sta_cfg.sta.password), config::kWifiPassword,
-               sizeof(sta_cfg.sta.password) - 1);
-  sta_cfg.sta.threshold.authmode = (config::kWifiPassword[0] == '\0') ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
-
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+  if (config::kWifiSsid[0] != '\0') {
+    std::strncpy(reinterpret_cast<char*>(sta_cfg.sta.ssid), config::kWifiSsid, sizeof(sta_cfg.sta.ssid) - 1);
+    std::strncpy(reinterpret_cast<char*>(sta_cfg.sta.password), config::kWifiPassword,
+                 sizeof(sta_cfg.sta.password) - 1);
+    sta_cfg.sta.threshold.authmode = (config::kWifiPassword[0] == '\0') ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+  } else {
+    // OTA release images deliberately carry no network secrets. ESP-IDF's
+    // default WIFI_STORAGE_FLASH retains the configuration written by the
+    // previous firmware, so leave it intact and reuse it. A first wired flash
+    // still needs menuconfig or wifi_secrets.h as documented.
+    ESP_ERROR_CHECK(esp_wifi_get_config(WIFI_IF_STA, &sta_cfg));
+    g_using_stored_credentials = sta_cfg.sta.ssid[0] != '\0';
+    if (!g_using_stored_credentials) {
+      ESP_LOGE(TAG, "no compiled or stored Wi-Fi SSID. Set it with `idf.py menuconfig` under "
+                    "\"Matrix Studio\" -> Wi-Fi, or copy main/wifi_secrets.h.example to "
+                    "main/wifi_secrets.h. The panel will keep running diagnostics but cannot connect.");
+    }
+  }
 
   // Power save off. docs/hardware.md calls this out as one of the specific
   // knobs ESP-IDF gives us to mitigate the Wi-Fi/DMA interference risk: modem
@@ -150,6 +162,8 @@ bool is_connected() {
   if (g_events == nullptr) return false;
   return (xEventGroupGetBits(g_events) & kConnectedBit) != 0;
 }
+
+bool has_network_config() { return config::kWifiSsid[0] != '\0' || g_using_stored_credentials; }
 
 const char* ip_address() { return g_ip; }
 

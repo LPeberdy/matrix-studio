@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5
+
+- Synchronise ingress preview requests to actual engine frames instead of an independent 24 FPS browser timer.
+- Raise ESP32 HUB75 scan cadence from about 76 Hz to about 287 Hz so network-frame swaps no longer produce perceptible periodic holds.
+- Ship firmware 0.1.2 for the new panel scan cadence; the wire protocol remains v1.
+- Preserve the panel's stored Wi-Fi credentials when installing a secret-free OTA release image.
+- Add a bounded JSON-chunk OTA staging API for authenticated automation clients that cannot send multipart files.
+
 ## 0.1.4
 
 - Remove plasma's periodic slow/fast beat by moving its interference field at one coherent velocity.

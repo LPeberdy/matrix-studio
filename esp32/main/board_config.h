@@ -110,7 +110,13 @@ constexpr bool kClockPhaseInverted = false;
 constexpr Hub75ClockSpeed kClockSpeed = Hub75ClockSpeed::HZ_20M;
 
 // Minimum panel refresh rate; the driver sizes its DMA descriptors from this.
-constexpr uint16_t kMinRefreshRateHz = 60;
+// At the previous 60 Hz minimum this 64x64/8-bit/20 MHz configuration scanned
+// at only ~76 Hz. Network frames are swapped on the next scan boundary, so a
+// free-running 20-60 FPS producer periodically missed a boundary and held one
+// frame longer. Requesting 240 Hz selects the next BCM timing tier (~287 Hz),
+// reducing that presentation quantisation from ~13.1 ms to ~3.5 ms without
+// raising the panel clock or changing the wire protocol.
+constexpr uint16_t kMinRefreshRateHz = 240;
 
 // OE blanking cycles around the latch pulse. Raise to 2 if the panel shows
 // faint ghosting of the row above/below.

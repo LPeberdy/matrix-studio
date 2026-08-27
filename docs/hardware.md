@@ -159,6 +159,20 @@ Arduino/PlatformIO.
 - render and network work remain separated so the sustained 24 FPS Wi-Fi/DMA
   test can expose any real contention
 
+The driver swaps a completed network frame only on a HUB75 scan boundary. At
+the original 60 Hz minimum, this panel's 64x64, 8-bit, 20 MHz configuration
+selected a roughly 76 Hz scan cadence; a free-running 20-60 FPS producer could
+therefore alternate between short and long frame holds. The firmware now asks
+for a 240 Hz minimum, selecting the driver's roughly 287 Hz BCM timing tier and
+reducing swap quantisation from about 13.1 ms to 3.5 ms.
+
+⚠️ The faster tier uses fewer binary-code-modulation time slices per scan. That
+can reduce the number of distinct low-brightness intensity steps even though
+the RGB565 input format is unchanged. Smooth gradients and dim colours must be
+checked on the physical panel after this timing change; if visible banding is a
+worse tradeoff than the former cadence, choose a lower intermediate scan tier
+from bench measurements rather than increasing the 20 MHz electrical clock.
+
 The project must still prove this combination on the real board for 15-30
 minutes; a successful firmware build is not evidence of radio/DMA stability.
 
@@ -177,6 +191,7 @@ The following are **not** yet proven:
 7. ❓ sustained Wi-Fi + HUB75 DMA behaviour at 24 FPS over 15-30 minutes
 8. ❓ a real end-to-end OTA update on this physical controller after initial
    streaming stability is established
+9. ❓ low-brightness gradient quality at the approximately 287 Hz scan tier
 
 ## Bring-up evidence to record
 

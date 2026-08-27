@@ -29,6 +29,12 @@ bool wait_connected(uint32_t timeout_ms);
 
 bool is_connected();
 
+// True when the station has either build-time credentials or a non-empty
+// configuration retained in NVS from the previous firmware. This deliberately
+// does not require association: a router outage must not reject a healthy OTA
+// image, but a secret-free image with erased NVS must roll back.
+bool has_network_config();
+
 // Dotted-quad address of the station, or "0.0.0.0" when not connected.
 const char* ip_address();
 

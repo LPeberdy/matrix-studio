@@ -98,3 +98,30 @@ async def test_every_subscriber_gets_its_own_copy():
         bus.publish(frame(timestamp_ms=42))
         assert (await asyncio.wait_for(first.get(), timeout=1)).timestamp_ms == 42
         assert (await asyncio.wait_for(second.get(), timeout=1)).timestamp_ms == 42
+
+
+async def test_next_after_waits_on_the_engine_clock_and_closes_the_publish_race():
+    bus = FrameBus()
+    bus.publish(frame(timestamp_ms=10))
+
+    waiting = asyncio.create_task(bus.next_after(10, timeout=1))
+    await asyncio.sleep(0)
+    assert not waiting.done()
+
+    bus.publish(frame(timestamp_ms=11))
+    assert (await waiting).timestamp_ms == 11
+
+    bus.publish(frame(timestamp_ms=12))
+    assert (await bus.next_after(11, timeout=1)).timestamp_ms == 12
+
+
+async def test_next_after_returns_promptly_when_controls_wake_the_bus():
+    bus = FrameBus()
+    current = frame(timestamp_ms=10)
+    bus.publish(current)
+
+    waiting = asyncio.create_task(bus.next_after(10, timeout=1))
+    await asyncio.sleep(0)
+    bus.wake_all()
+
+    assert await waiting is current
